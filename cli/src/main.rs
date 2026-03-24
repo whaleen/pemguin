@@ -696,11 +696,18 @@ fn git_in(dir: &Path, args: &[&str]) -> Option<String> {
 
 fn parse_repo(url: &str) -> String {
     let url = url.trim().trim_end_matches(".git");
+    // HTTPS: https://host/owner/repo or http://host/owner/repo
+    if url.starts_with("https://") || url.starts_with("http://") {
+        let prefix = if url.starts_with("https://") { 8 } else { 7 };
+        if let Some(slash) = url[prefix..].find('/') {
+            return url[prefix + slash + 1..].to_string();
+        }
+    }
+    // SSH: git@host:owner/repo
     if let Some(pos) = url.rfind(':') {
         let after = &url[pos + 1..];
         if after.contains('/') { return after.to_string(); }
     }
-    if let Some(pos) = url.find("github.com/") { return url[pos + 11..].to_string(); }
     url.to_string()
 }
 
