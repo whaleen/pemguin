@@ -1,10 +1,10 @@
 # pemguin 🐧
 
-Terminal project manager for Claude Code workflows.
+Terminal project manager for developers who live in the CLI.
 
 ## What it does
 
-`pm` is a Ratatui TUI that keeps your dev projects organized. For each project it surfaces the things you reach for constantly when working with an AI coding agent — setup status, GitHub issues, prompts, memory files, skills, and MCP servers — without leaving the terminal.
+`pm` is a Ratatui TUI that keeps your dev projects organized. For each project it surfaces setup status, GitHub issues, prompts, memory files, skills, and MCP servers — all without leaving the terminal.
 
 ## Install
 
