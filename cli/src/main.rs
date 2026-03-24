@@ -114,6 +114,7 @@ struct Project {
     setup_total: usize,
 }
 
+#[derive(Clone)]
 enum ProjectEntry {
     Group(String),  // section header
     Item(usize),    // index into app.projects
@@ -394,6 +395,7 @@ struct App {
     project_entries: Vec<ProjectEntry>, // flat render list (Group headers + Item refs)
     project_list_state: ListState,
     active_project_idx: Option<usize>, // index into projects; set on drill-in
+    projects_msg: Option<String>,       // transient status shown in footer
     // Home (project sub-screen)
     home_data: Option<HomeData>,
     home_edit: Option<HomeEditField>,
@@ -598,6 +600,20 @@ fn save_meta_cache(cache: &HashMap<String, RepoMeta>) {
     if let Ok(json) = serde_json::to_string_pretty(cache) {
         let _ = fs::write(&path, json);
     }
+}
+
+fn refresh_project_meta(repo: &str) -> Option<RepoMeta> {
+    if !repo.contains('/') { return None; }
+    let out = Command::new("gh")
+        .args(["repo", "view", repo, "--json", "primaryLanguage,repositoryTopics,pushedAt"])
+        .output().ok()?;
+    if !out.status.success() { return None; }
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    let language = v["primaryLanguage"]["name"].as_str().map(|s| s.to_string());
+    let topics = v["repositoryTopics"].as_array().unwrap_or(&vec![])
+        .iter().filter_map(|t| t["name"].as_str().map(|s| s.to_string())).collect();
+    let pushed_at = v["pushedAt"].as_str().map(|s| s.to_string());
+    Some(RepoMeta { language, topics, pushed_at })
 }
 
 fn sync_meta(projects: &[Project]) -> HashMap<String, RepoMeta> {
@@ -952,7 +968,7 @@ impl App {
             prompt_state: PromptState::Browse { list_state: prompt_ls },
             issues: vec![], issue_list_state: ListState::default(), issues_error: None,
             projects, project_entries, project_list_state: project_ls,
-            active_project_idx: None,
+            active_project_idx: None, projects_msg: None,
             home_data: None,
             home_edit: None, home_edit_input: String::new(), home_save_msg: None,
             setup_items: vec![], setup_list_state: setup_ls, setup_message: None,
@@ -1355,13 +1371,33 @@ fn handle_projects(app: &mut App, key: KeyCode) -> bool {
             }
         }
         KeyCode::Char('r') => {
+            if let Some(entry_idx) = app.project_list_state.selected() {
+                if let Some(ProjectEntry::Item(proj_idx)) = app.project_entries.get(entry_idx).cloned() {
+                    let p = &app.projects[proj_idx];
+                    let (path, group) = (p.path.clone(), p.group.clone());
+                    if let Some(fresh) = project_info(&path, group) {
+                        let repo = fresh.repo.clone();
+                        app.projects[proj_idx] = fresh;
+                        app.project_entries = build_project_entries(&app.projects);
+                        // gh meta refresh (blocking but only one repo)
+                        match refresh_project_meta(&repo) {
+                            Some(meta) => {
+                                app.meta_cache.insert(repo.clone(), meta);
+                                save_meta_cache(&app.meta_cache);
+                                app.projects_msg = Some(format!("{repo} refreshed"));
+                            }
+                            None => {
+                                app.projects_msg = Some(format!("{repo} — git refreshed (gh meta unavailable)"));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        KeyCode::Char('R') => {
             app.projects = scan_projects(&app.config);
             app.project_entries = build_project_entries(&app.projects);
-        }
-        KeyCode::Char('s') => {
-            let fresh = sync_meta(&app.projects);
-            app.meta_cache.extend(fresh);
-            save_meta_cache(&app.meta_cache);
+            app.projects_msg = Some("all projects rescanned".to_string());
         }
         _ => {}
     }
@@ -1855,7 +1891,14 @@ fn draw_projects(frame: &mut Frame, app: &App) {
         );
     }
 
-    frame.render_widget(Paragraph::new(footer(&[("↑↓/jk","navigate"),("enter","open project"),("r","rescan"),("s","sync github"),("q","quit")])), outer[2]);
+    let footer_line = if let Some(msg) = &app.projects_msg {
+        let mut spans = footer(&[("↑↓/jk","navigate"),("enter","open"),("r","refresh"),("R","rescan all"),("q","quit")]).spans;
+        spans.push(Span::styled(format!("  {msg}"), Style::default().fg(FG_DIM)));
+        Line::from(spans)
+    } else {
+        footer(&[("↑↓/jk","navigate"),("enter","open"),("r","refresh"),("R","rescan all"),("q","quit")])
+    };
+    frame.render_widget(Paragraph::new(footer_line), outer[2]);
 }
 
 fn handle_memories(app: &mut App, key: KeyCode) -> bool {
