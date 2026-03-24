@@ -1,79 +1,123 @@
-# [Project Name] Spec
+# pemguin — Spec
 
-> One-line description of what this project is and who it's for.
+Feature source of truth. Update this when features ship, change, or get cut.
 
-## What This Is
+## Projects List
 
-Brief narrative — the problem being solved, who it's for, why it exists.
+- ✅ Scan projects directory up to 2 levels deep for `.git` dirs
+- ✅ Group projects by parent directory name
+- ✅ Show repo name, branch, dirty status, commits ahead
+- ✅ Responsive repo name column width
+- ✅ Rescan on `r`
+- ✅ GitHub metadata sync on `s` (description, topics)
+- ✅ Org avatar rendering via chafa (cached)
+- ✅ Enter to open a project
+- 📋 Filter / search projects by name
+- 📋 Pin frequently used projects
+- 📋 3-level scan depth (opt-in)
 
----
+## Project Home Tab
 
-## Features
+- ✅ GitHub description, homepage URL, repo URL
+- ✅ Edit description and homepage via `gh repo edit`
+- ✅ Copy URL to clipboard with `y`
+- ✅ Stack field (from `.pemguin.toml` or metadata)
+- ✅ Topics from GitHub metadata
+- ✅ Setup score (N/M configured)
+- ✅ Recent commits list
+- ✅ Org avatar display
+- 📋 Git status summary (dirty file count, ahead/behind remote)
+- 📋 Stash count
 
-### [Feature Area 1]
+## Issues Tab
 
-Requirements stated as observable behaviors, not implementation details. Each requirement should be verifiable by looking at the running app.
+- ✅ List open GitHub issues via `gh`
+- ✅ Issue title, number, labels
+- ✅ Issue body preview
+- ✅ Copy issue prompt to clipboard on enter
+- 📋 Create issue from within pm
+- 📋 Close / comment on issue
 
-- Submitting an empty form shows a red border on required fields
-- Deleting the last item shows the empty state illustration, not a blank screen
-- If a fetch fails, an inline error appears — not a toast
+## Setup Tab
 
-### [Feature Area 2]
+- ✅ Check for AGENT.md / CLAUDE.md
+- ✅ Check for SPEC.md
+- ✅ Check for .mcp.json
+- ✅ Check for skills-lock.json
+- ✅ Check for stale AGENTS.md (old format)
+- ✅ Apply missing items on enter
+- ✅ Apply all on `a`
+- ✅ Rescan on `r`
+- 📋 Check for CONSTITUTION.md symlink
+- 📋 Check for .memory/ directory
 
-- ...
+## Prompts Tab
 
----
+- ✅ Browse global prompts (`~/.pemguin/prompts/`)
+- ✅ Browse project prompts (`.prompts/`)
+- ✅ Preview prompt content
+- ✅ Fill in placeholders interactively
+- ✅ Auto-fill `{REPO}`, `{ISSUE}`, `{BRANCH}` from context
+- ✅ Copy filled prompt to clipboard
+- 📋 Create new prompt from within pm
+- 📋 Edit prompt from within pm
 
-## Data & State
+## Memories Tab
 
-- What persists (localStorage, database, URL params, in-memory only)
-- What resets on page refresh
-- Any sync requirements between views or components
+- ✅ Browse project memory (`.memory/`)
+- ✅ Browse global memory (`~/.pemguin/memory/`)
+- ✅ Browse Claude memory (`.claude/.../memory/`)
+- ✅ Preview memory file content
+- ✅ Create new memory file (prompts for name, opens `$EDITOR`)
+- ✅ Edit existing memory file in `$EDITOR`
+- ✅ Delete memory file with `d`
+- ✅ Migrate Claude memory file to `.memory/` with `m`
+- ✅ Reload on `r`
 
----
+## Skills Tab
 
-## Out of Scope
+- ✅ Read installed skills from `skills-lock.json`
+- ✅ Show skill name, source repo, description
+- 📋 Install skill from within pm
+- 📋 Remove skill from within pm
 
-Things explicitly NOT part of this project to prevent scope creep:
+## MCP Tab
 
-- ...
+- ✅ Read configured servers from `.mcp.json`
+- ✅ Show server name, command, args
+- 📋 Add / edit / remove MCP server from within pm
 
----
+## Pane Tab (tab 8)
 
-## Docs
+- ✅ Placeholder with ASCII art
+- 📋 Embedded child TUI via `tui-term` PTY
+- 📋 Yazi file browser as first child
+- 📋 `Ctrl+W` to toggle focus between pane and pm nav
+- 📋 Session persistence (child stays alive when switching tabs)
 
-Detailed behavioral specs, architecture notes, and feature deep-dives live in `docs/`. Each feature area in this spec should have a corresponding doc if it needs more than a few bullet points.
+## Navigation & UX
 
-- `docs/features/` — cross-cutting features
-- `docs/architecture/` — system design and data flow
-- `docs/<appname>/` — per-view behavioral specs
+- ✅ Number keys 1–8 to switch tabs
+- ✅ Tab key cycles through tabs
+- ✅ Esc = back (InProject → Projects)
+- ✅ Split header: identity row (badge + project + branch) + nav row (tabs)
+- ✅ Footer hints update per-screen and per-mode
+- ✅ Earthy color theme (Ratatui Color::Rgb palette)
+- ✅ Nerd Font icons throughout
+- ✅ Sidebar hidden below 70 col
+- 📋 Mouse support
+- 📋 Configurable color theme
 
----
+## Configuration
 
-## Tracking
+- ✅ `~/.pemguin.toml` — projects root, future options
+- ✅ `PEMGUIN_PROJECTS_DIR` env var override
+- 📋 Per-project config overrides
+- 📋 Custom scan depth
 
-Requirements are tracked as GitHub Issues. SPEC.md is the source of truth — issues are the execution units.
+## Known Issues
 
-### Creating an issue from this spec
-
-```bash
-gh issue create --title "[View] requirement" --body "$(cat <<'EOF'
-## What
-<what to build or change>
-
-## Acceptance Criteria
-- <observable behavior 1>
-- <observable behavior 2>
-
-## Scope
-<files or views to touch — be explicit about what NOT to touch>
-EOF
-)"
-```
-
-### Issue workflow
-
-1. Create the issue from a spec requirement
-2. Hand to an agent with the prompt in `project-scaffolding/prompts/work-on-issue.md`
-3. Agent works, runs `vp check` + `vp build`, commits with `closes #N`
-4. Bring back to Claude to review the diff and close the issue if complete
+- All data loads are synchronous — the UI freezes briefly on project open and GitHub sync
+- `gh` errors surface as status messages but don't retry
+- Pane tab is non-functional (placeholder only)
+- Nerd Font glyphs render as boxes in terminals without Nerd Font support

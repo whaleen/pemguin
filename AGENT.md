@@ -1,114 +1,60 @@
-# [Project Name] — Agent Context
-
-> Copy this to the project root as AGENT.md and fill it in.
-> Global context lives at /Users/josh/Projects/AGENT.md and CONSTITUTION.md.
+# pemguin — Agent Context
 
 ## What This Project Is
 
-One paragraph. What does it do, who uses it, what problem does it solve.
+pemguin (`pm`) is a terminal project manager TUI built with Ratatui. It gives developers a single place to navigate all their local git repos — viewing GitHub issues, checking project setup status, browsing prompts and memory files, and inspecting installed skills and MCP servers. It is agent-agnostic: designed for any AI-assisted dev workflow, not tied to a specific tool.
 
 ## Stack
 
-Languages, frameworks, bundler, package manager, database, deployment target — whatever this project actually uses.
+- **Language**: Rust (stable)
+- **TUI**: Ratatui 0.29 + Crossterm 0.28
+- **External tools**: `gh` CLI (GitHub operations), `chafa` (avatar rendering), `$EDITOR` (file editing)
+- **Config**: `~/.pemguin.toml` (TOML), `~/.pemguin/` runtime dir (prompts, memory, avatars, cache)
+- **Deployment**: local binary via `cargo install --path cli`
 
 ## Running Locally
 
 ```bash
-# Start dev server (Vite+ project)
-vp dev
-
-# Run checks (format + lint + typecheck)
-vp check
-
-# Run tests
-vp test
-
-# Any other processes that need to run alongside it
+cd cli
+cargo run                 # dev build
+cargo install --path .    # install to ~/.cargo/bin/pm
 ```
+
+Prerequisites: Rust stable, `gh` CLI authenticated, Nerd Font terminal. `chafa` is optional (org avatar rendering).
+
+Config: `~/.pemguin.toml` — set `projects.root` to your projects directory. Defaults to `~/Projects`.
 
 ## Key Files & Directories
 
 ```
-src/
-  components/   — ...
-  pages/        — ...
-  hooks/        — ...
+cli/
+  src/main.rs       — entire application (single file)
+  Cargo.toml        — dependencies
+prompts/            — built-in prompt templates (work-on-issue, deploy)
+stacks/             — stack reference sheets (rust, vite-react, etc.)
+docs/               — architecture and feature documentation
+CONSTITUTION.md     — universal dev principles, referenced by agents globally
+~/.pemguin.toml     — runtime config (projects root dir)
+~/.pemguin/
+  prompts/          — global prompts shown in every project's Prompts tab
+  memory/           — global memory files
+  avatars/          — cached GitHub org avatar images (chafa ANSI art)
+  cache.json        — GitHub metadata cache
 ```
-
-## Current Focus
-
-What is actively being worked on right now. Update this as work shifts.
 
 ## Gotchas
 
-Things that aren't obvious from reading the code:
-
-- Any quirks, workarounds, or non-obvious decisions
-- Why something was done a certain way if it looks wrong
-
-## Skills
-
-Skills live in `.agents/skills/` (all agents) with `.claude/skills/` symlinks (Claude specifically).
-
-Discover available skills:
-```bash
-npx skills add <owner/repo> --list
-```
-
-Install a skill for all agents — omit `-a` flag to target all agents automatically:
-```bash
-npx skills add <owner/repo> --skill <name> -y
-```
-
-Example — common skills by stack:
-```bash
-# Vite React (all projects)
-npx skills add vercel-labs/agent-skills --skill vercel-react-best-practices -y
-npx skills add vercel-labs/agent-skills --skill vercel-composition-patterns -y
-npx skills add vercel-labs/agent-skills --skill web-design-guidelines -y
-
-# Convex projects
-npx skills add https://github.com/waynesutton/convexskills --skill convex -y
-
-# Supabase projects
-npx skills add supabase/agent-skills --skill supabase-postgres-best-practices -y
-```
-
-See what's installed:
-```bash
-npx skills list
-```
-
-Installed project skills:
-- _none yet_
-
-## Issue Workflow
-
-Work is tracked as GitHub Issues. When assigned an issue:
-
-1. Read this file and SPEC.md before touching any code
-2. Read the issue in full: `gh issue view <number>`
-3. Touch only files relevant to the issue — do not refactor unrelated code
-4. Run `vp check` and `vp build` — both must pass before committing
-5. Commit with: `fix: <description> (closes #<number>)`
-6. Do not close the issue. Do not open a PR. Stop after the commit.
-
-Claude reviews the commit and closes the issue if complete.
-
-## Memory
-
-Read `.memory/MEMORY.md` before starting work. It indexes project-scoped memory files — load only the ones relevant to the current task.
-
-Write new learnings, decisions, and gotchas back to `.memory/` as you go. Update the index in `.memory/MEMORY.md`.
-
-For global context that applies across all projects, read `~/.pemguin/memory/MEMORY.md`.
-
-## Agent Responsibilities
-
-- Keep this file current. If you change the stack, commands, or major features, update AGENT.md and README.md as part of the same task.
-- Update `## Current Focus` at the start of each session to reflect what's actively being worked on.
-- SPEC.md is the feature source of truth. If a feature ships or changes, update it.
+- **Single source file**: all TUI state, rendering, key handling, and data loading live in `cli/src/main.rs`.
+- **2-level scan**: `scan_projects()` walks at most 2 levels deep from the configured root. The `.git` dir must be at level 1 or 2 — repos nested deeper won't appear.
+- **`gh` CLI required**: issues, descriptions, homepage edits, and GitHub sync all shell out to `gh`. The app degrades gracefully when unavailable but most features won't work.
+- **Nerd Font required**: tab icons and status indicators use Nerd Font codepoints. Without a Nerd Font the UI shows replacement characters.
+- **Pane tab (8) is a placeholder**: reserved for an embedded child TUI (Yazi, Helix) via `tui-term`. PTY plumbing is not implemented yet; `Ctrl+W` is reserved for pane focus handoff.
 
 ## Spec
 
 See SPEC.md for the feature checklist.
+
+## Docs
+
+- `docs/architecture/overview.md` — app structure, state, key handling, data flow, scan logic
+- `docs/status.md` — what's working, known rough edges, what's next
