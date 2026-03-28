@@ -6,6 +6,8 @@ Terminal project manager for developers who live in the CLI.
 
 `pm` is a Ratatui TUI that keeps your dev projects organized. For each project it surfaces setup status, GitHub issues, prompts, memory files, skills, and MCP servers — all without leaving the terminal.
 
+Startup scanning and GitHub-backed project data load in the background, so the UI stays responsive while data hydrates.
+
 ## Install
 
 ```bash
@@ -41,7 +43,8 @@ Navigate with `↑↓` or `jk`. Press `enter` to open a project. `esc` goes back
 
 | Key | Action |
 |-----|--------|
-| `r` | Rescan projects directory |
+| `r` | Refresh selected project row |
+| `R` | Rescan all projects |
 | `s` | Sync GitHub metadata |
 | `enter` | Open project |
 | `q` | Quit |

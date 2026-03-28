@@ -21,7 +21,7 @@ fi
 if [ -f "$PROJECT_DIR/AGENT.md" ]; then
   echo "  AGENT.md already exists — skipping"
 else
-  cp "$SCAFFOLDING_DIR/AGENT.md" "$PROJECT_DIR/AGENT.md"
+  cp "$SCAFFOLDING_DIR/templates/AGENT.md" "$PROJECT_DIR/AGENT.md"
   echo "  Created AGENT.md"
 fi
 
@@ -29,7 +29,7 @@ fi
 if [ -f "$PROJECT_DIR/SPEC.md" ]; then
   echo "  SPEC.md already exists — skipping"
 else
-  cp "$SCAFFOLDING_DIR/SPEC.md" "$PROJECT_DIR/SPEC.md"
+  cp "$SCAFFOLDING_DIR/templates/SPEC.md" "$PROJECT_DIR/SPEC.md"
   echo "  Created SPEC.md"
 fi
 
@@ -74,8 +74,35 @@ else
 skills-lock.json
 CLAUDE.md
 GEMINI.md
+.memory/
 EOF
   echo "  Patched .gitignore"
+fi
+
+# 7. Create .memory index
+mkdir -p "$PROJECT_DIR/.memory"
+if [ -f "$PROJECT_DIR/.memory/MEMORY.md" ]; then
+  echo "  .memory/MEMORY.md already exists — skipping"
+else
+  cat > "$PROJECT_DIR/.memory/MEMORY.md" <<'EOF'
+# Memory Index
+
+Agent memory for this project. Read this first, then load only the files relevant to the current task.
+
+> Format: `- [filename.md](filename.md) - one-line description`
+
+<!-- add entries below as memories are created -->
+EOF
+  echo "  Created .memory/MEMORY.md"
+fi
+
+# 8. Create .prompts sample prompt
+mkdir -p "$PROJECT_DIR/.prompts"
+if [ -f "$PROJECT_DIR/.prompts/work-on-task.md" ]; then
+  echo "  .prompts/work-on-task.md already exists — skipping"
+else
+  cp "$SCAFFOLDING_DIR/templates/prompts/work-on-task.md" "$PROJECT_DIR/.prompts/work-on-task.md"
+  echo "  Created .prompts/work-on-task.md"
 fi
 
 echo ""

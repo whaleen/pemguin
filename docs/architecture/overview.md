@@ -65,22 +65,25 @@ Sub-flows (prompt fill, home edit, memory input) capture all keys and suppress g
     repo-c/cli/     ← level 3, .git present → NOT found
 ```
 
-For each found directory, `project_info()` runs `git` subprocesses to get remote URL, current branch, dirty status, and commits-ahead count.
+For each found directory, `project_info()` runs git inspection and setup checks, and scanning is parallelized across worker threads. The initial scan runs in the background after the TUI opens.
 
 ## Data Flow
 
 ```
+App::new()
+  → spawn background scan_projects()
+  → render root immediately
+  → apply AsyncResult::Projects when scan finishes
+
 App::open_project(idx)
-  → scan_setup_items()       — synchronous filesystem checks
-  → load_home_data()         — gh CLI calls (blocks UI briefly)
-  → load_issues()            — gh CLI call
+  → load_home_data_local()   — local git/setup reads only
   → load_prompts()           — filesystem read
-  → load_memories()          — filesystem read
-  → load_skills()            — reads skills-lock.json
-  → load_mcp_servers()       — reads .mcp.json
+  → scan_setup()             — filesystem checks
+  → spawn background Home hydrate (gh repo view + avatar)
+  → defer Issues / Memories / Skills / MCP until tab visit
 ```
 
-All I/O is synchronous. There is no async loading or spinner.
+Background work returns through an internal async result channel that is polled from the main event loop. The UI renders loading states while Home, Issues, avatar, or project scans are in flight.
 
 ## Prompt System
 
