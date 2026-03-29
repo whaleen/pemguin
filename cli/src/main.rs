@@ -52,6 +52,7 @@ const I_MEMORY: &str = "\u{f0eb}"; // lightbulb (memories)
 const I_SKILLS: &str = "\u{f0ad}"; // wrench
 const I_MCP: &str = "\u{f0c1}"; // link/chain
 const I_PANE: &str = "\u{f120}"; // >_ terminal prompt
+const I_SESSIONS: &str = "\u{f017}"; // clock
 
 const GITIGNORE_BLOCK: &str = "\n# Agent dirs\n.agents/\n.claude/\n.kiro/\n.vite-hooks/\nskills-lock.json\nCLAUDE.md\nGEMINI.md\n.memory/\n";
 const PEMGUIN_PROJECT_CONFIG_TEMPLATE: &str = "[setup]\nignore = []\ndisable = []\n";
@@ -158,6 +159,81 @@ enum ProjectTab {
     Skills,
     Mcp,
     Pane,
+    Sessions,
+}
+
+#[derive(PartialEq, Clone, Debug)]
+enum AgentKind {
+    Claude,
+    Codex,
+    Gemini,
+}
+
+impl AgentKind {
+    fn label(&self) -> &'static str {
+        match self {
+            AgentKind::Claude => "claude",
+            AgentKind::Codex => "codex",
+            AgentKind::Gemini => "gemini",
+        }
+    }
+
+    fn launch_cmd(&self, project_path: &Path, prompt: Option<&str>) -> String {
+        let mcp = project_path.join(".mcp.json");
+        let has_mcp = mcp.exists();
+        match self {
+            AgentKind::Claude => {
+                let mut cmd = String::from("claude");
+                if has_mcp {
+                    cmd.push_str(" --mcp-config .mcp.json");
+                }
+                if let Some(p) = prompt {
+                    cmd.push_str(&format!(" --prompt-file .prompts/{}", p));
+                }
+                cmd
+            }
+            AgentKind::Codex => {
+                let mut cmd = String::from("codex");
+                if let Some(p) = prompt {
+                    cmd.push_str(&format!(" --instructions .prompts/{}", p));
+                }
+                cmd
+            }
+            AgentKind::Gemini => String::from("gemini"),
+        }
+    }
+
+    fn resume_cmd(&self, session_id: &str) -> String {
+        match self {
+            AgentKind::Claude => format!("claude --resume {}", session_id),
+            AgentKind::Codex => format!("codex --session {}", session_id),
+            AgentKind::Gemini => format!("gemini  # session: {}", session_id),
+        }
+    }
+
+    fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "claude" => Some(AgentKind::Claude),
+            "codex" => Some(AgentKind::Codex),
+            "gemini" => Some(AgentKind::Gemini),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct AgentSession {
+    id: Option<String>,        // None until resolved from agent storage
+    agent: AgentKind,
+    started_at: String,        // ISO 8601
+    prompt: Option<String>,    // .prompts/ filename used, if any
+    first_message: Option<String>,
+}
+
+#[derive(PartialEq, Clone)]
+enum SessionsState {
+    List,
+    NewPicker { agent_idx: usize, prompt_idx: Option<usize> },
 }
 
 #[derive(PartialEq, Clone)]
@@ -918,6 +994,12 @@ struct App {
     mcp_loaded: bool,
     pane_list_state: ListState,
     pane_message: Option<String>,
+    // Sessions
+    sessions: Vec<AgentSession>,
+    sessions_list_state: ListState,
+    sessions_loaded: bool,
+    sessions_state: SessionsState,
+    sessions_message: Option<String>,
     // Active context
     context: String,
     repo: String,
@@ -2106,6 +2188,11 @@ impl App {
             mcp_loaded: false,
             pane_list_state: pane_ls,
             pane_message: None,
+            sessions: vec![],
+            sessions_list_state: ListState::default(),
+            sessions_loaded: false,
+            sessions_state: SessionsState::List,
+            sessions_message: None,
             context: String::new(),
             repo: String::new(),
             async_tx,
@@ -2246,6 +2333,11 @@ impl App {
         self.mcp_servers = vec![];
         self.mcp_list_state = ListState::default();
         self.mcp_loaded = false;
+        self.sessions = vec![];
+        self.sessions_list_state = ListState::default();
+        self.sessions_loaded = false;
+        self.sessions_state = SessionsState::List;
+        self.sessions_message = None;
         let repo = self.repo.clone();
         self.start_home_load(&path, &repo);
         // Drill in
@@ -2295,6 +2387,22 @@ impl App {
                     s
                 };
                 self.mcp_loaded = true;
+            }
+            ProjectTab::Sessions if !self.sessions_loaded => {
+                let Some(idx) = self.active_project_idx else { return; };
+                let Some(project) = self.projects.get(idx) else { return; };
+                let path = project.path.clone();
+                self.sessions = load_sessions(&path);
+                resolve_sessions(&mut self.sessions, &path);
+                save_sessions(&path, &self.sessions);
+                self.sessions_list_state = {
+                    let mut s = ListState::default();
+                    if !self.sessions.is_empty() {
+                        s.select(Some(0));
+                    }
+                    s
+                };
+                self.sessions_loaded = true;
             }
             _ => {}
         }
@@ -2515,7 +2623,8 @@ fn handle_key(app: &mut App, key: KeyCode, modifiers: KeyModifiers) -> bool {
                             Screen::InProject(ProjectTab::Memories) => ProjectTab::Skills,
                             Screen::InProject(ProjectTab::Skills) => ProjectTab::Mcp,
                             Screen::InProject(ProjectTab::Mcp) => ProjectTab::Pane,
-                            Screen::InProject(ProjectTab::Pane) => ProjectTab::Home,
+                            Screen::InProject(ProjectTab::Pane) => ProjectTab::Sessions,
+                            Screen::InProject(ProjectTab::Sessions) => ProjectTab::Home,
                             _ => ProjectTab::Home,
                         };
                         app.set_project_tab(next);
@@ -2553,6 +2662,10 @@ fn handle_key(app: &mut App, key: KeyCode, modifiers: KeyModifiers) -> bool {
                         app.set_project_tab(ProjectTab::Pane);
                         return false;
                     }
+                    KeyCode::Char('9') => {
+                        app.set_project_tab(ProjectTab::Sessions);
+                        return false;
+                    }
                     _ => {}
                 }
             }
@@ -2571,6 +2684,7 @@ fn handle_key(app: &mut App, key: KeyCode, modifiers: KeyModifiers) -> bool {
                 ProjectTab::Skills => handle_skills(app, key),
                 ProjectTab::Mcp => handle_mcp(app, key),
                 ProjectTab::Pane => handle_pane(app, key),
+                ProjectTab::Sessions => handle_sessions(app, key),
             }
         }
     }
@@ -3096,6 +3210,7 @@ fn draw(frame: &mut Frame, app: &App) {
         (Screen::InProject(ProjectTab::Skills), _) => draw_skills(frame, app),
         (Screen::InProject(ProjectTab::Mcp), _) => draw_mcp(frame, app),
         (Screen::InProject(ProjectTab::Pane), _) => draw_pane(frame, app),
+        (Screen::InProject(ProjectTab::Sessions), _) => draw_sessions(frame, app),
     }
     if let Some(confirm) = &app.pending_delete {
         draw_delete_confirm(frame, confirm);
@@ -3191,6 +3306,7 @@ fn nav_row(app: &App) -> Line<'static> {
         (I_SKILLS, "skills", 6, *active_tab == ProjectTab::Skills),
         (I_MCP, "mcp", 7, *active_tab == ProjectTab::Mcp),
         (I_PANE, "pane", 8, *active_tab == ProjectTab::Pane),
+        (I_SESSIONS, "sessions", 9, *active_tab == ProjectTab::Sessions),
     ];
     for (icon, label, n, active) in tabs {
         spans.extend(tab_span(icon, label, *n, *active));
@@ -4811,6 +4927,555 @@ fn handle_pane(app: &mut App, key: KeyCode) -> bool {
         _ => {}
     }
     false
+}
+
+// ── Sessions persistence ──────────────────────────────────────────────────────
+
+fn sessions_path(project_path: &Path) -> PathBuf {
+    project_path.join(".pemguin").join("sessions.toml")
+}
+
+fn load_sessions(project_path: &Path) -> Vec<AgentSession> {
+    let path = sessions_path(project_path);
+    let content = match fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return vec![],
+    };
+    let doc: toml::Value = match toml::from_str(&content) {
+        Ok(v) => v,
+        Err(_) => return vec![],
+    };
+    let arr = match doc.get("session").and_then(|v| v.as_array()) {
+        Some(a) => a.clone(),
+        None => return vec![],
+    };
+    let mut sessions: Vec<AgentSession> = arr
+        .iter()
+        .filter_map(|v| {
+            let agent_str = v.get("agent")?.as_str()?;
+            let agent = AgentKind::from_str(agent_str)?;
+            let started_at = v.get("started_at")?.as_str()?.to_string();
+            let id = v
+                .get("id")
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_string());
+            let prompt = v
+                .get("prompt")
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_string());
+            let first_message = v
+                .get("first_message")
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_string());
+            Some(AgentSession { id, agent, started_at, prompt, first_message })
+        })
+        .collect();
+    // Most recent first
+    sessions.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+    sessions
+}
+
+fn save_sessions(project_path: &Path, sessions: &[AgentSession]) {
+    let dir = project_path.join(".pemguin");
+    let _ = fs::create_dir_all(&dir);
+    let path = dir.join("sessions.toml");
+    let mut out = String::new();
+    for s in sessions {
+        out.push_str("[[session]]\n");
+        out.push_str(&format!("agent = \"{}\"\n", s.agent.label()));
+        out.push_str(&format!("started_at = \"{}\"\n", s.started_at));
+        if let Some(id) = &s.id {
+            out.push_str(&format!("id = \"{}\"\n", id));
+        }
+        if let Some(p) = &s.prompt {
+            out.push_str(&format!("prompt = \"{}\"\n", p));
+        }
+        if let Some(m) = &s.first_message {
+            let escaped = m.replace('\\', "\\\\").replace('"', "\\\"");
+            out.push_str(&format!("first_message = \"{}\"\n", escaped));
+        }
+        out.push('\n');
+    }
+    let _ = fs::write(&path, out);
+}
+
+// Attempt to resolve pending sessions by scanning agent storage.
+// For Claude Code: ~/.claude/projects/{encoded-path}/{uuid}.jsonl
+// Match unresolved sessions by finding JSONL files created within 120s of started_at.
+fn resolve_sessions(sessions: &mut Vec<AgentSession>, project_path: &Path) {
+    let unresolved: Vec<usize> = sessions
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.id.is_none() && s.agent == AgentKind::Claude)
+        .map(|(i, _)| i)
+        .collect();
+    if unresolved.is_empty() {
+        return;
+    }
+
+    // Encode project path the same way Claude Code does:
+    // absolute path with '/' replaced by '-'
+    let encoded = project_path
+        .to_string_lossy()
+        .replace('/', "-");
+    let claude_dir = dirs_home()
+        .map(|h| h.join(".claude").join("projects").join(&encoded))
+        .filter(|p| p.exists());
+
+    let Some(claude_dir) = claude_dir else { return };
+
+    let jsonl_files: Vec<(String, std::time::SystemTime)> = fs::read_dir(&claude_dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.path()
+                .extension()
+                .and_then(|x| x.to_str())
+                .map(|x| x == "jsonl")
+                .unwrap_or(false)
+        })
+        .filter_map(|e| {
+            let mtime = e.metadata().ok()?.modified().ok()?;
+            let stem = e.path().file_stem()?.to_str()?.to_string();
+            Some((stem, mtime))
+        })
+        .collect();
+
+    for idx in unresolved {
+        let session = &sessions[idx];
+        // Parse started_at as a rough timestamp for comparison
+        let Ok(session_time) = chrono_parse(&session.started_at) else {
+            continue;
+        };
+        // Find a JSONL file whose mtime is within 120s of started_at
+        if let Some((uuid, _)) = jsonl_files.iter().find(|(_, mtime)| {
+            let secs = mtime
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let diff = (secs as i64 - session_time as i64).abs();
+            diff < 120
+        }) {
+            // Try to read first user message
+            let jsonl_path = claude_dir.join(format!("{}.jsonl", uuid));
+            let first_msg = read_first_user_message(&jsonl_path);
+            sessions[idx].id = Some(uuid.clone());
+            if sessions[idx].first_message.is_none() {
+                sessions[idx].first_message = first_msg;
+            }
+        }
+    }
+}
+
+// Parse ISO 8601 timestamp to unix seconds (simplified, no external crate)
+fn chrono_parse(s: &str) -> Result<u64, ()> {
+    // Expects format: 2026-03-29T14:23:00Z or similar
+    let s = s.trim_end_matches('Z');
+    let parts: Vec<&str> = s.splitn(2, 'T').collect();
+    if parts.len() != 2 {
+        return Err(());
+    }
+    let date: Vec<u64> = parts[0].split('-').filter_map(|p| p.parse().ok()).collect();
+    let time: Vec<u64> = parts[1].split(':').filter_map(|p| p.parse().ok()).collect();
+    if date.len() < 3 || time.len() < 2 {
+        return Err(());
+    }
+    // Rough unix seconds (good enough for 120s proximity matching)
+    let days_since_epoch = (date[0] - 1970) * 365 + (date[1] - 1) * 30 + date[2];
+    let secs = days_since_epoch * 86400 + time[0] * 3600 + time[1] * 60 + time.get(2).copied().unwrap_or(0);
+    Ok(secs)
+}
+
+fn read_first_user_message(path: &Path) -> Option<String> {
+    let content = fs::read_to_string(path).ok()?;
+    for line in content.lines() {
+        let v: serde_json::Value = serde_json::from_str(line).ok()?;
+        if v.get("type").and_then(|t| t.as_str()) == Some("user") {
+            if let Some(msg) = v
+                .get("message")
+                .and_then(|m| m.get("content"))
+                .and_then(|c| c.as_str())
+            {
+                let trimmed = msg.trim().to_string();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.chars().take(80).collect());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn now_iso() -> String {
+    // Use file mtime of a temp write as a proxy since we have no chrono dep
+    // Fall back to a static format using std::time
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Convert unix seconds to rough ISO 8601 (good enough for sorting/display)
+    let s = secs;
+    let min = s / 60;
+    let hour = min / 60;
+    let day_total = hour / 24;
+    let sec = s % 60;
+    let min = min % 60;
+    let hour = hour % 24;
+    // Compute year/month/day from day_total (rough, ignores leap years perfectly)
+    let mut year = 1970u64;
+    let mut days = day_total;
+    loop {
+        let y_days = if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) { 366 } else { 365 };
+        if days < y_days { break; }
+        days -= y_days;
+        year += 1;
+    }
+    let month_days = [31u64, if year % 4 == 0 { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mut month = 0usize;
+    for &md in &month_days {
+        if days < md { break; }
+        days -= md;
+        month += 1;
+    }
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", year, month + 1, days + 1, hour, min, sec)
+}
+
+fn format_session_date(iso: &str) -> String {
+    // Extract just the date and time portion for display
+    iso.trim_end_matches('Z')
+        .replacen('T', " ", 1)
+        .chars()
+        .take(16)
+        .collect()
+}
+
+// ── Sessions handler ──────────────────────────────────────────────────────────
+
+fn handle_sessions(app: &mut App, key: KeyCode) -> bool {
+    match &app.sessions_state.clone() {
+        SessionsState::NewPicker { agent_idx, prompt_idx } => {
+            let agents = [AgentKind::Claude, AgentKind::Codex, AgentKind::Gemini];
+            let agent_count = agents.len();
+            match key {
+                KeyCode::Esc => {
+                    app.sessions_state = SessionsState::List;
+                    app.sessions_message = None;
+                }
+                KeyCode::Left | KeyCode::Char('h') => {
+                    let new_idx = if *agent_idx == 0 { agent_count - 1 } else { agent_idx - 1 };
+                    app.sessions_state = SessionsState::NewPicker { agent_idx: new_idx, prompt_idx: *prompt_idx };
+                }
+                KeyCode::Right | KeyCode::Char('l') => {
+                    let new_idx = (agent_idx + 1) % agent_count;
+                    app.sessions_state = SessionsState::NewPicker { agent_idx: new_idx, prompt_idx: *prompt_idx };
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    // Cycle through prompts (None + project prompts)
+                    let prompt_count = app.project_prompts.len();
+                    let new_pidx = match prompt_idx {
+                        None => {
+                            if prompt_count > 0 { Some(prompt_count - 1) } else { None }
+                        }
+                        Some(i) => if *i == 0 { None } else { Some(i - 1) },
+                    };
+                    app.sessions_state = SessionsState::NewPicker { agent_idx: *agent_idx, prompt_idx: new_pidx };
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    let prompt_count = app.project_prompts.len();
+                    let new_pidx = match prompt_idx {
+                        None => if prompt_count > 0 { Some(0) } else { None },
+                        Some(i) => {
+                            if i + 1 < prompt_count { Some(i + 1) } else { None }
+                        }
+                    };
+                    app.sessions_state = SessionsState::NewPicker { agent_idx: *agent_idx, prompt_idx: new_pidx };
+                }
+                KeyCode::Enter | KeyCode::Char('y') => {
+                    let agent = agents[*agent_idx].clone();
+                    let prompt_name = prompt_idx.and_then(|i| app.project_prompts.get(i)).map(|p| p.name.clone());
+                    let Some(proj_idx) = app.active_project_idx else { return false; };
+                    let Some(project) = app.projects.get(proj_idx) else { return false; };
+                    let path = project.path.clone();
+                    let cmd = agent.launch_cmd(&path, prompt_name.as_deref());
+                    // Write to clipboard
+                    if let Ok(mut cb) = Clipboard::new() {
+                        let _ = cb.set_text(&cmd);
+                    }
+                    // Record pending session
+                    let session = AgentSession {
+                        id: None,
+                        agent,
+                        started_at: now_iso(),
+                        prompt: prompt_name,
+                        first_message: None,
+                    };
+                    app.sessions.insert(0, session);
+                    save_sessions(&path, &app.sessions);
+                    if app.sessions_list_state.selected().is_none() {
+                        app.sessions_list_state.select(Some(0));
+                    }
+                    app.sessions_state = SessionsState::List;
+                    app.sessions_message = Some(format!("copied: {}", cmd));
+                }
+                _ => {}
+            }
+        }
+        SessionsState::List => {
+            let len = app.sessions.len();
+            match key {
+                KeyCode::Char('n') => {
+                    app.sessions_state = SessionsState::NewPicker { agent_idx: 0, prompt_idx: None };
+                    app.sessions_message = None;
+                }
+                KeyCode::Down | KeyCode::Char('j') if len > 0 => {
+                    let n = (app.sessions_list_state.selected().unwrap_or(0) + 1) % len;
+                    app.sessions_list_state.select(Some(n));
+                    app.sessions_message = None;
+                }
+                KeyCode::Up | KeyCode::Char('k') if len > 0 => {
+                    let n = app.sessions_list_state.selected()
+                        .map(|i| if i == 0 { len - 1 } else { i - 1 })
+                        .unwrap_or(0);
+                    app.sessions_list_state.select(Some(n));
+                    app.sessions_message = None;
+                }
+                KeyCode::Enter | KeyCode::Char('y') => {
+                    if let Some(i) = app.sessions_list_state.selected() {
+                        if let Some(s) = app.sessions.get(i) {
+                            if let Some(id) = &s.id {
+                                let cmd = s.agent.resume_cmd(id);
+                                if let Ok(mut cb) = Clipboard::new() {
+                                    let _ = cb.set_text(&cmd);
+                                }
+                                app.sessions_message = Some(format!("copied: {}", cmd));
+                            } else {
+                                app.sessions_message = Some("no session id — run the session first".to_string());
+                            }
+                        }
+                    }
+                }
+                KeyCode::Char('d') => {
+                    if let Some(i) = app.sessions_list_state.selected() {
+                        let Some(proj_idx) = app.active_project_idx else { return false; };
+                        let Some(project) = app.projects.get(proj_idx) else { return false; };
+                        let path = project.path.clone();
+                        app.sessions.remove(i);
+                        if !app.sessions.is_empty() {
+                            let new_sel = if i >= app.sessions.len() { app.sessions.len() - 1 } else { i };
+                            app.sessions_list_state.select(Some(new_sel));
+                        } else {
+                            app.sessions_list_state.select(None);
+                        }
+                        save_sessions(&path, &app.sessions);
+                        app.sessions_message = Some("session removed".to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    false
+}
+
+// ── Sessions draw ─────────────────────────────────────────────────────────────
+
+fn draw_sessions(frame: &mut Frame, app: &App) {
+    let area = frame.area();
+    let outer = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+    frame.render_widget(Paragraph::new(header_row(app)), outer[0]);
+    frame.render_widget(Paragraph::new(nav_row(app)), outer[1]);
+
+    // Footer
+    let footer = if let SessionsState::NewPicker { .. } = &app.sessions_state {
+        Line::from(vec![
+            Span::styled("←/→", Style::default().fg(ACCENT)),
+            Span::raw(" agent  "),
+            Span::styled("↑/↓", Style::default().fg(ACCENT)),
+            Span::raw(" prompt  "),
+            Span::styled("enter", Style::default().fg(ACCENT)),
+            Span::raw(" copy & record  "),
+            Span::styled("esc", Style::default().fg(FG_DIM)),
+            Span::raw(" cancel"),
+        ])
+    } else {
+        let has_id = app.sessions_list_state.selected()
+            .and_then(|i| app.sessions.get(i))
+            .and_then(|s| s.id.as_ref())
+            .is_some();
+        let mut spans = vec![
+            Span::styled("n", Style::default().fg(ACCENT)),
+            Span::raw(" new  "),
+        ];
+        if has_id {
+            spans.extend([
+                Span::styled("y", Style::default().fg(ACCENT)),
+                Span::raw(" copy resume  "),
+            ]);
+        }
+        if !app.sessions.is_empty() {
+            spans.extend([
+                Span::styled("d", Style::default().fg(ACCENT)),
+                Span::raw(" delete"),
+            ]);
+        }
+        Line::from(spans)
+    };
+
+    if let SessionsState::NewPicker { agent_idx, prompt_idx } = &app.sessions_state {
+        let agents = ["claude", "codex", "gemini"];
+        // Build agent selector line
+        let agent_spans: Vec<Span> = agents.iter().enumerate().flat_map(|(i, a)| {
+            let active = i == *agent_idx;
+            let span = if active {
+                Span::styled(a.to_string(), Style::default().fg(SEL_FG).bg(ACCENT).add_modifier(Modifier::BOLD))
+            } else {
+                Span::styled(a.to_string(), Style::default().fg(FG_DIM))
+            };
+            vec![span, Span::raw("  ")]
+        }).collect();
+
+        // Build prompt selector
+        let prompt_names: Vec<String> = std::iter::once("(none)".to_string())
+            .chain(app.project_prompts.iter().map(|p| p.name.clone()))
+            .collect();
+        let selected_prompt_idx = prompt_idx.map(|i| i + 1).unwrap_or(0);
+        let prompt_spans: Vec<Span> = prompt_names.iter().enumerate().flat_map(|(i, name)| {
+            let active = i == selected_prompt_idx;
+            let span = if active {
+                Span::styled(name.clone(), Style::default().fg(SEL_FG).bg(ACCENT).add_modifier(Modifier::BOLD))
+            } else {
+                Span::styled(name.clone(), Style::default().fg(FG_DIM))
+            };
+            vec![span, Span::raw("  ")]
+        }).collect();
+
+        // Preview the generated command
+        let Some(proj_idx) = app.active_project_idx else { return; };
+        let Some(project) = app.projects.get(proj_idx) else { return; };
+        let agent_kind = [AgentKind::Claude, AgentKind::Codex, AgentKind::Gemini][*agent_idx].clone();
+        let prompt_name = prompt_idx.and_then(|i| app.project_prompts.get(i)).map(|p| p.name.as_str());
+        let cmd_preview = agent_kind.launch_cmd(&project.path, prompt_name);
+
+        let content = vec![
+            Line::from(""),
+            Line::from(vec![Span::styled("  agent   ", Style::default().fg(FG_DIM))].into_iter().chain(agent_spans).collect::<Vec<_>>()),
+            Line::from(""),
+            Line::from(vec![Span::styled("  prompt  ", Style::default().fg(FG_DIM))].into_iter().chain(prompt_spans).collect::<Vec<_>>()),
+            Line::from(""),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("  $ ", Style::default().fg(FG_DIM)),
+                Span::styled(cmd_preview, Style::default().fg(C_GREEN)),
+            ]),
+        ];
+
+        frame.render_widget(
+            Paragraph::new(content)
+                .block(Block::default().borders(Borders::ALL).title(" new session ")),
+            outer[2],
+        );
+    } else if app.sessions.is_empty() {
+        let content = vec![
+            Line::from(""),
+            Line::from(Span::styled("  no sessions recorded", Style::default().fg(Color::DarkGray))),
+            Line::from(""),
+            Line::from(Span::styled("  n  new session", Style::default().fg(FG_XDIM))),
+        ];
+        frame.render_widget(
+            Paragraph::new(content)
+                .block(Block::default().borders(Borders::ALL).title(" sessions ")),
+            outer[2],
+        );
+    } else {
+        let main = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+            .split(outer[2]);
+
+        let items: Vec<ListItem> = app.sessions.iter().map(|s| {
+            let date = format_session_date(&s.started_at);
+            let label = format!("{}  {}", s.agent.label(), date);
+            ListItem::new(label)
+        }).collect();
+
+        let mut ls = app.sessions_list_state.clone();
+        frame.render_stateful_widget(
+            List::new(items)
+                .block(Block::default().borders(Borders::ALL).title(" sessions "))
+                .highlight_style(hl())
+                .highlight_symbol("> "),
+            main[0],
+            &mut ls,
+        );
+
+        // Detail pane
+        let detail = app.sessions_list_state.selected()
+            .and_then(|i| app.sessions.get(i))
+            .map(|s| {
+                let mut lines = vec![
+                    Line::from(Span::styled(
+                        s.agent.label().to_uppercase(),
+                        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from(""),
+                    Line::from(vec![
+                        Span::styled("started   ", Style::default().fg(FG_DIM)),
+                        Span::raw(format_session_date(&s.started_at)),
+                    ]),
+                ];
+                if let Some(p) = &s.prompt {
+                    lines.push(Line::from(vec![
+                        Span::styled("prompt    ", Style::default().fg(FG_DIM)),
+                        Span::raw(p.clone()),
+                    ]));
+                }
+                if let Some(id) = &s.id {
+                    lines.push(Line::from(""));
+                    lines.push(Line::from(vec![
+                        Span::styled("resume    ", Style::default().fg(FG_DIM)),
+                        Span::styled(s.agent.resume_cmd(id), Style::default().fg(C_GREEN)),
+                    ]));
+                } else {
+                    lines.push(Line::from(""));
+                    lines.push(Line::from(Span::styled(
+                        "  pending — id resolves after first session run",
+                        Style::default().fg(FG_XDIM),
+                    )));
+                }
+                if let Some(m) = &s.first_message {
+                    lines.push(Line::from(""));
+                    lines.push(Line::from(vec![
+                        Span::styled("first msg ", Style::default().fg(FG_DIM)),
+                        Span::raw(m.clone()),
+                    ]));
+                }
+                lines
+            })
+            .unwrap_or_default();
+
+        frame.render_widget(
+            Paragraph::new(detail)
+                .block(Block::default().borders(Borders::ALL))
+                .wrap(Wrap { trim: true }),
+            main[1],
+        );
+    }
+
+    // Status/message bar
+    let status = app.sessions_message.as_deref().map(|m| {
+        Line::from(Span::styled(format!(" {}", m), Style::default().fg(C_GREEN)))
+    }).unwrap_or(footer);
+    frame.render_widget(Paragraph::new(status), outer[3]);
 }
 
 fn handle_skills(app: &mut App, key: KeyCode) -> bool {
