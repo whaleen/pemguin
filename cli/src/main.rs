@@ -2594,6 +2594,9 @@ fn handle_key(app: &mut App, key: KeyCode, modifiers: KeyModifiers) -> bool {
     if app.pending_delete.is_some() {
         return handle_delete_confirm(app, key);
     }
+    if matches!(&app.sessions_state, SessionsState::Summary { .. }) {
+        return handle_sessions(app, key);
+    }
     if key == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL) {
         return true;
     }
@@ -5270,6 +5273,24 @@ fn write_export(project_path: &Path, session: &AgentSession, content: &str, ext:
     Some(path)
 }
 
+fn session_is_exported(session: &AgentSession, project_path: &Path) -> bool {
+    let id = match &session.id {
+        Some(id) => id,
+        None => return false,
+    };
+    let short_id = &id[..id.len().min(8)];
+    let exports_dir = project_path.join(".pemguin").join("exports");
+    fs::read_dir(&exports_dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .any(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .contains(short_id)
+        })
+}
+
 fn jsonl_path_for_session(session: &AgentSession, project_path: &Path) -> Option<PathBuf> {
     let id = session.id.as_ref()?;
     for dir in claude_project_dirs(project_path) {
@@ -5689,10 +5710,23 @@ fn draw_sessions(frame: &mut Frame, app: &App) {
             .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
             .split(outer[2]);
 
+        let project_path = app.active_project_idx
+            .and_then(|i| app.projects.get(i))
+            .map(|p| p.path.clone());
+
         let items: Vec<ListItem> = app.sessions.iter().map(|s| {
             let date = format_session_date(&s.started_at);
-            let label = format!("{}  {}", s.agent.label(), date);
-            ListItem::new(label)
+            let exported = project_path.as_deref()
+                .map(|p| session_is_exported(s, p))
+                .unwrap_or(false);
+            let export_mark = if exported { " ↓" } else { "" };
+            let pending_mark = if s.id.is_none() { " ·" } else { "" };
+            let spans = vec![
+                Span::raw(format!("{}  {}", s.agent.label(), date)),
+                Span::styled(export_mark.to_string(), Style::default().fg(C_GREEN)),
+                Span::styled(pending_mark.to_string(), Style::default().fg(FG_XDIM)),
+            ];
+            ListItem::new(Line::from(spans))
         }).collect();
 
         let mut ls = app.sessions_list_state.clone();
