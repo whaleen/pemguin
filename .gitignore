@@ -3,7 +3,6 @@ cli/target/
 # Agent dirs
 .agents/
 .claude/
-.kiro/
 .vite-hooks/
 skills-lock.json
 CLAUDE.md

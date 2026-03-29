@@ -4,7 +4,7 @@ Terminal project manager for developers who live in the CLI.
 
 ## What it does
 
-`pm` is a Ratatui TUI that keeps your dev projects organized. For each project it surfaces setup status, GitHub issues, prompts, memory files, skills, and MCP servers — all without leaving the terminal.
+`pm` is a Ratatui TUI that keeps your dev projects organized. For each project it surfaces config status, GitHub issues, prompts, memory files, skills, MCP servers, and project tools — all without leaving the terminal.
 
 Startup scanning and GitHub-backed project data load in the background, so the UI stays responsive while data hydrates.
 
@@ -32,12 +32,12 @@ Navigate with `↑↓` or `jk`. Press `enter` to open a project. `esc` goes back
 |-----|-----|
 | `1` | Home — repo info, description, recent commits |
 | `2` | Issues — open GitHub issues, copy prompt to work on one |
-| `3` | Setup — checklist: AGENT.md, SPEC.md, CLAUDE.md, .mcp.json, skills |
+| `3` | Config — managed repo files like AGENT.md, SPEC.md, .gitignore, prompts, memory |
 | `4` | Prompts — global (`~/.pemguin/prompts/`) and project (`.prompts/`) |
 | `5` | Memories — `.memory/`, `~/.pemguin/memory/`, `.claude/.../memory/` |
 | `6` | Skills — installed skills from `skills-lock.json` |
 | `7` | MCP — configured servers from `.mcp.json` |
-| `8` | Pane — reserved for embedded child TUI (yazi, helix, …) |
+| `8` | Pane — launch project tools like `lazygit`, `yazi`, and `$EDITOR` |
 
 ### Projects root
 

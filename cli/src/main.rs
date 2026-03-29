@@ -53,12 +53,29 @@ const I_SKILLS: &str = "\u{f0ad}"; // wrench
 const I_MCP: &str = "\u{f0c1}"; // link/chain
 const I_PANE: &str = "\u{f120}"; // >_ terminal prompt
 
+const GITIGNORE_BLOCK: &str = "\n# Agent dirs\n.agents/\n.claude/\n.kiro/\n.vite-hooks/\nskills-lock.json\nCLAUDE.md\nGEMINI.md\n.memory/\n";
+const PEMGUIN_PROJECT_CONFIG_TEMPLATE: &str = "[setup]\nignore = []\ndisable = []\n";
+
 // ── Config ────────────────────────────────────────────────────────────────────
 
 #[derive(Clone, serde::Deserialize, Default)]
 struct Config {
     #[serde(default)]
     projects: ProjectsConfig,
+}
+
+#[derive(Clone, serde::Deserialize, Default)]
+struct ProjectPemguinConfig {
+    #[serde(default)]
+    setup: ProjectSetupConfig,
+}
+
+#[derive(Clone, serde::Deserialize, Default)]
+struct ProjectSetupConfig {
+    #[serde(default)]
+    ignore: Vec<String>,
+    #[serde(default)]
+    disable: Vec<String>,
 }
 
 #[derive(Clone, serde::Deserialize, Default)]
@@ -70,6 +87,13 @@ fn load_config() -> Config {
     let home = dirs_home().unwrap_or_default();
     let path = home.join(".pemguin.toml");
     fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| toml::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn load_project_pemguin_config(path: &Path) -> ProjectPemguinConfig {
+    fs::read_to_string(path.join(".pemguin.toml"))
         .ok()
         .and_then(|s| toml::from_str(&s).ok())
         .unwrap_or_default()
@@ -173,6 +197,22 @@ struct McpServer {
     name: String,
     command: String,
     args: Vec<String>,
+}
+
+struct ExternalCommand {
+    program: String,
+    args: Vec<String>,
+    cwd: PathBuf,
+}
+
+struct TextEditorState {
+    path: PathBuf,
+    title: String,
+    lines: Vec<String>,
+    row: usize,
+    col: usize,
+    selection_anchor: Option<(usize, usize)>,
+    status: Option<String>,
 }
 
 struct HomeData {
@@ -312,6 +352,12 @@ enum SetupStatus {
     Stale,
 }
 
+enum SetupAction {
+    Apply,
+    Reset,
+    Delete,
+}
+
 #[derive(Clone)]
 struct SetupItem {
     label: &'static str,
@@ -319,7 +365,16 @@ struct SetupItem {
     status: SetupStatus,
 }
 
+fn setup_item_ignored(cfg: &ProjectPemguinConfig, label: &str) -> bool {
+    cfg.setup.ignore.iter().any(|s| s == label)
+}
+
+fn setup_item_disabled(cfg: &ProjectPemguinConfig, label: &str) -> bool {
+    cfg.setup.disable.iter().any(|s| s == label)
+}
+
 fn scan_setup(path: &Path) -> Vec<SetupItem> {
+    let cfg = load_project_pemguin_config(path);
     let agent_ok = path.join("AGENT.md").exists();
     let spec_ok = path.join("SPEC.md").exists();
     let claude_ok = {
@@ -337,6 +392,7 @@ fn scan_setup(path: &Path) -> Vec<SetupItem> {
     let agents_stale = path.join("AGENTS.md").exists();
     let prompts_ok = path.join(".prompts").is_dir();
     let memory_ok = path.join(".memory").join("MEMORY.md").exists();
+    let pemguin_cfg_ok = path.join(".pemguin.toml").exists();
 
     let mut items = vec![
         SetupItem {
@@ -411,6 +467,15 @@ fn scan_setup(path: &Path) -> Vec<SetupItem> {
                 SetupStatus::Missing
             },
         },
+        SetupItem {
+            label: ".pemguin.toml",
+            detail: "repo-local pemguin config",
+            status: if pemguin_cfg_ok {
+                SetupStatus::Ok
+            } else {
+                SetupStatus::Missing
+            },
+        },
     ];
     if agents_stale {
         items.push(SetupItem {
@@ -419,84 +484,275 @@ fn scan_setup(path: &Path) -> Vec<SetupItem> {
             status: SetupStatus::Stale,
         });
     }
+    items.retain(|item| {
+        !setup_item_ignored(&cfg, item.label) && !setup_item_disabled(&cfg, item.label)
+    });
     items
 }
 
-fn apply_setup_item(project_path: &Path, item: &SetupItem) -> Result<String, String> {
+fn setup_item_edit_path(project_path: &Path, item: &SetupItem) -> Option<PathBuf> {
+    match item.label {
+        "AGENT.md" | "CLAUDE.md → AGENT.md" | "GEMINI.md → AGENT.md" => {
+            Some(project_path.join("AGENT.md"))
+        }
+        "SPEC.md" => Some(project_path.join("SPEC.md")),
+        "docs/" => Some(project_path.join("docs").join("README.md")),
+        ".gitignore" => Some(project_path.join(".gitignore")),
+        ".prompts/" => Some(project_path.join(".prompts").join("work-on-task.md")),
+        ".memory/" => Some(project_path.join(".memory").join("MEMORY.md")),
+        ".pemguin.toml" => Some(project_path.join(".pemguin.toml")),
+        "AGENTS.md" => Some(project_path.join("AGENTS.md")),
+        _ => None,
+    }
+}
+
+fn remove_gitignore_block(project_path: &Path) -> Result<(), String> {
+    let gitignore = project_path.join(".gitignore");
+    let content = match fs::read_to_string(&gitignore) {
+        Ok(s) => s,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.to_string()),
+    };
+    let next = content.replace(GITIGNORE_BLOCK, "\n");
+    fs::write(&gitignore, next).map_err(|e| e.to_string())
+}
+
+fn apply_setup_item(
+    project_path: &Path,
+    item: &SetupItem,
+    action: SetupAction,
+) -> Result<String, String> {
+    let project_cfg = load_project_pemguin_config(project_path);
+    if setup_item_disabled(&project_cfg, item.label) {
+        return Ok(format!(
+            "{} disabled by .pemguin.toml — skipped",
+            item.label
+        ));
+    }
     let pemguin_dir = std::env::var("PEMGUIN_DIR")
         .or_else(|_| std::env::var("SCAFFOLD_DIR"))
         .map(PathBuf::from)
         .map_err(|_| "$PEMGUIN_DIR not set".to_string())?;
 
     match item.label {
-        "AGENT.md" => fs::copy(
-            template_file(&pemguin_dir, "AGENT.md"),
-            project_path.join("AGENT.md"),
-        )
-        .map(|_| "Created AGENT.md".to_string())
-        .map_err(|e| e.to_string()),
-        "SPEC.md" => fs::copy(
-            template_file(&pemguin_dir, "SPEC.md"),
-            project_path.join("SPEC.md"),
-        )
-        .map(|_| "Created SPEC.md".to_string())
-        .map_err(|e| e.to_string()),
-        "CLAUDE.md → AGENT.md" => {
-            std::os::unix::fs::symlink("AGENT.md", project_path.join("CLAUDE.md"))
-                .map(|_| "Symlinked CLAUDE.md → AGENT.md".to_string())
+        "AGENT.md" => {
+            let dst = project_path.join("AGENT.md");
+            if matches!(action, SetupAction::Apply) && dst.exists() {
+                return Ok("AGENT.md already exists — skipped".to_string());
+            }
+            fs::copy(template_file(&pemguin_dir, "AGENT.md"), &dst)
+                .map(|_| {
+                    if matches!(action, SetupAction::Reset) {
+                        "Reset AGENT.md".to_string()
+                    } else {
+                        "Created AGENT.md".to_string()
+                    }
+                })
                 .map_err(|e| e.to_string())
         }
-        "GEMINI.md → AGENT.md" => {
-            std::os::unix::fs::symlink("AGENT.md", project_path.join("GEMINI.md"))
-                .map(|_| "Symlinked GEMINI.md → AGENT.md".to_string())
+        "SPEC.md" => {
+            let dst = project_path.join("SPEC.md");
+            if matches!(action, SetupAction::Apply) && dst.exists() {
+                return Ok("SPEC.md already exists — skipped".to_string());
+            }
+            fs::copy(template_file(&pemguin_dir, "SPEC.md"), &dst)
+                .map(|_| {
+                    if matches!(action, SetupAction::Reset) {
+                        "Reset SPEC.md".to_string()
+                    } else {
+                        "Created SPEC.md".to_string()
+                    }
+                })
                 .map_err(|e| e.to_string())
         }
+        "CLAUDE.md → AGENT.md" => match action {
+            SetupAction::Delete => fs::remove_file(project_path.join("CLAUDE.md"))
+                .map(|_| "Removed CLAUDE.md".to_string())
+                .map_err(|e| e.to_string()),
+            SetupAction::Apply | SetupAction::Reset => {
+                let dst = project_path.join("CLAUDE.md");
+                if matches!(action, SetupAction::Apply) && dst.exists() {
+                    return Ok("CLAUDE.md already exists — skipped".to_string());
+                }
+                if dst.exists() {
+                    let _ = fs::remove_file(&dst);
+                }
+                std::os::unix::fs::symlink("AGENT.md", dst)
+                    .map(|_| {
+                        if matches!(action, SetupAction::Reset) {
+                            "Reset CLAUDE.md → AGENT.md".to_string()
+                        } else {
+                            "Symlinked CLAUDE.md → AGENT.md".to_string()
+                        }
+                    })
+                    .map_err(|e| e.to_string())
+            }
+        },
+        "GEMINI.md → AGENT.md" => match action {
+            SetupAction::Delete => fs::remove_file(project_path.join("GEMINI.md"))
+                .map(|_| "Removed GEMINI.md".to_string())
+                .map_err(|e| e.to_string()),
+            SetupAction::Apply | SetupAction::Reset => {
+                let dst = project_path.join("GEMINI.md");
+                if matches!(action, SetupAction::Apply) && dst.exists() {
+                    return Ok("GEMINI.md already exists — skipped".to_string());
+                }
+                if dst.exists() {
+                    let _ = fs::remove_file(&dst);
+                }
+                std::os::unix::fs::symlink("AGENT.md", dst)
+                    .map(|_| {
+                        if matches!(action, SetupAction::Reset) {
+                            "Reset GEMINI.md → AGENT.md".to_string()
+                        } else {
+                            "Symlinked GEMINI.md → AGENT.md".to_string()
+                        }
+                    })
+                    .map_err(|e| e.to_string())
+            }
+        },
         "docs/" => {
             let src = pemguin_dir.join("docs");
             let dst = project_path.join("docs");
-            copy_dir_recursive(&src, &dst)
-                .map(|_| "Created docs/".to_string())
-                .map_err(|e| e.to_string())
+            match action {
+                SetupAction::Delete => fs::remove_dir_all(&dst)
+                    .map(|_| "Removed docs/".to_string())
+                    .map_err(|e| e.to_string()),
+                SetupAction::Apply => {
+                    if dst.exists() {
+                        return Ok("docs/ already exists — skipped".to_string());
+                    }
+                    copy_dir_recursive(&src, &dst)
+                        .map(|_| "Created docs/".to_string())
+                        .map_err(|e| e.to_string())
+                }
+                SetupAction::Reset => copy_dir_recursive(&src, &dst)
+                    .map(|_| "Reset docs/".to_string())
+                    .map_err(|e| e.to_string()),
+            }
         }
         ".memory/" => {
             let dir = project_path.join(".memory");
-            fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
             let index = dir.join("MEMORY.md");
-            if !index.exists() {
-                fs::write(&index, MEMORY_INDEX_TEMPLATE).map_err(|e| e.to_string())?;
+            match action {
+                SetupAction::Delete => fs::remove_dir_all(&dir)
+                    .map(|_| "Removed .memory/".to_string())
+                    .map_err(|e| e.to_string()),
+                SetupAction::Apply => {
+                    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+                    if index.exists() {
+                        return Ok(".memory/MEMORY.md already exists — skipped".to_string());
+                    }
+                    fs::write(&index, MEMORY_INDEX_TEMPLATE).map_err(|e| e.to_string())?;
+                    Ok("Created .memory/MEMORY.md".to_string())
+                }
+                SetupAction::Reset => {
+                    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+                    fs::write(&index, MEMORY_INDEX_TEMPLATE).map_err(|e| e.to_string())?;
+                    Ok("Reset .memory/MEMORY.md".to_string())
+                }
             }
-            Ok("Created .memory/MEMORY.md".to_string())
         }
-        ".gitignore" => {
-            let gitignore = project_path.join(".gitignore");
-            let block = "\n# Agent dirs\n.agents/\n.claude/\n.kiro/\n.vite-hooks/\nskills-lock.json\nCLAUDE.md\nGEMINI.md\n.memory/\n";
-            let mut f = fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&gitignore)
-                .map_err(|e| e.to_string())?;
-            use std::io::Write;
-            f.write_all(block.as_bytes()).map_err(|e| e.to_string())?;
-            Ok("Patched .gitignore".to_string())
-        }
+        ".gitignore" => match action {
+            SetupAction::Delete => {
+                remove_gitignore_block(project_path)?;
+                Ok("Removed pemguin block from .gitignore".to_string())
+            }
+            SetupAction::Apply => {
+                let gitignore = project_path.join(".gitignore");
+                let current = fs::read_to_string(&gitignore).unwrap_or_default();
+                if current.contains("# Agent dirs") {
+                    return Ok(".gitignore already patched — skipped".to_string());
+                }
+                let mut f = fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&gitignore)
+                    .map_err(|e| e.to_string())?;
+                use std::io::Write;
+                f.write_all(GITIGNORE_BLOCK.as_bytes())
+                    .map_err(|e| e.to_string())?;
+                Ok("Patched .gitignore".to_string())
+            }
+            SetupAction::Reset => {
+                remove_gitignore_block(project_path)?;
+                let gitignore = project_path.join(".gitignore");
+                let mut f = fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&gitignore)
+                    .map_err(|e| e.to_string())?;
+                use std::io::Write;
+                f.write_all(GITIGNORE_BLOCK.as_bytes())
+                    .map_err(|e| e.to_string())?;
+                Ok("Reset .gitignore pemguin block".to_string())
+            }
+        },
         ".prompts/" => {
             let dir = project_path.join(".prompts");
-            fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
             let sample = dir.join("work-on-task.md");
-            if !sample.exists() {
-                fs::copy(
-                    template_file(&pemguin_dir, "prompts/work-on-task.md"),
-                    &sample,
-                )
-                .map_err(|e| e.to_string())?;
+            match action {
+                SetupAction::Delete => fs::remove_dir_all(&dir)
+                    .map(|_| "Removed .prompts/".to_string())
+                    .map_err(|e| e.to_string()),
+                SetupAction::Apply => {
+                    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+                    if sample.exists() {
+                        return Ok(".prompts/work-on-task.md already exists — skipped".to_string());
+                    }
+                    fs::copy(
+                        template_file(&pemguin_dir, "prompts/work-on-task.md"),
+                        &sample,
+                    )
+                    .map_err(|e| e.to_string())?;
+                    Ok("Created .prompts/ with sample prompt".to_string())
+                }
+                SetupAction::Reset => {
+                    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+                    fs::copy(
+                        template_file(&pemguin_dir, "prompts/work-on-task.md"),
+                        &sample,
+                    )
+                    .map_err(|e| e.to_string())?;
+                    Ok("Reset .prompts/work-on-task.md".to_string())
+                }
             }
-            Ok("Created .prompts/ with sample prompt".to_string())
+        }
+        ".pemguin.toml" => {
+            let path = project_path.join(".pemguin.toml");
+            match action {
+                SetupAction::Delete => fs::remove_file(&path)
+                    .map(|_| "Removed .pemguin.toml".to_string())
+                    .map_err(|e| e.to_string()),
+                SetupAction::Apply => {
+                    if path.exists() {
+                        return Ok(".pemguin.toml already exists — skipped".to_string());
+                    }
+                    fs::write(&path, PEMGUIN_PROJECT_CONFIG_TEMPLATE).map_err(|e| e.to_string())?;
+                    Ok("Created .pemguin.toml".to_string())
+                }
+                SetupAction::Reset => {
+                    fs::write(&path, PEMGUIN_PROJECT_CONFIG_TEMPLATE).map_err(|e| e.to_string())?;
+                    Ok("Reset .pemguin.toml".to_string())
+                }
+            }
         }
         "AGENTS.md" => fs::remove_file(project_path.join("AGENTS.md"))
             .map(|_| "Removed stale AGENTS.md".to_string())
             .map_err(|e| e.to_string()),
         _ => Err("unknown item".to_string()),
     }
+}
+
+fn edit_setup_item(project_path: &Path, item: &SetupItem) -> Result<PathBuf, String> {
+    let project_cfg = load_project_pemguin_config(project_path);
+    if setup_item_disabled(&project_cfg, item.label) {
+        return Err(format!("{} disabled by .pemguin.toml", item.label));
+    }
+    if item.status == SetupStatus::Missing {
+        let _ = apply_setup_item(project_path, item, SetupAction::Apply)?;
+    }
+    setup_item_edit_path(project_path, item).ok_or_else(|| "item is not editable".to_string())
 }
 
 fn template_file(pemguin_dir: &Path, relative: &str) -> PathBuf {
@@ -519,19 +775,18 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> io::Result<()> {
 }
 
 fn apply_all_setup(project_path: &Path) -> Result<String, String> {
-    let pemguin_dir = std::env::var("PEMGUIN_DIR")
-        .or_else(|_| std::env::var("SCAFFOLD_DIR"))
-        .map_err(|_| "$PEMGUIN_DIR not set".to_string())?;
-    let init_sh = PathBuf::from(&pemguin_dir).join("init.sh");
-    let out = Command::new("bash")
-        .arg(&init_sh)
-        .current_dir(project_path)
-        .output()
-        .map_err(|e| e.to_string())?;
-    if out.status.success() {
-        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    let mut applied = Vec::new();
+    for item in scan_setup(project_path) {
+        if item.status == SetupStatus::Stale {
+            continue;
+        }
+        let msg = apply_setup_item(project_path, &item, SetupAction::Apply)?;
+        applied.push(msg);
+    }
+    if applied.is_empty() {
+        Ok("Nothing to apply.".to_string())
     } else {
-        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+        Ok(applied.join(" | "))
     }
 }
 
@@ -548,6 +803,27 @@ enum PromptState {
     Done(String),
 }
 
+enum DeleteTarget {
+    Prompt {
+        path: PathBuf,
+        name: String,
+    },
+    Memory {
+        path: PathBuf,
+        name: String,
+    },
+    Setup {
+        project_path: PathBuf,
+        item: SetupItem,
+    },
+}
+
+struct DeleteConfirm {
+    title: String,
+    detail: String,
+    target: DeleteTarget,
+}
+
 struct App {
     config: Config,
     screen: Screen,
@@ -557,6 +833,9 @@ struct App {
     prompts_view: PromptsView,
     prompts: Vec<Prompt>, // current display list (points at global or project)
     prompt_state: PromptState,
+    prompt_input: String,
+    prompt_inputting: bool,
+    prompt_message: Option<String>,
     // Issues
     issues: Vec<Issue>,
     issue_list_state: ListState,
@@ -596,6 +875,9 @@ struct App {
     memory_input: String,
     memory_inputting: bool,
     pending_editor: Option<PathBuf>,
+    text_editor: Option<TextEditorState>,
+    pending_delete: Option<DeleteConfirm>,
+    pending_command: Option<ExternalCommand>,
     // Skills
     skills: Vec<Skill>,
     skills_list_state: ListState,
@@ -604,6 +886,8 @@ struct App {
     mcp_servers: Vec<McpServer>,
     mcp_list_state: ListState,
     mcp_loaded: bool,
+    pane_list_state: ListState,
+    pane_message: Option<String>,
     // Active context
     context: String,
     repo: String,
@@ -1124,6 +1408,227 @@ fn git(args: &[&str]) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+fn editor_command(target: &Path) -> Command {
+    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
+    let mut parts = editor.split_whitespace();
+    let program = parts.next().unwrap_or("vi");
+    let mut cmd = Command::new(program);
+    cmd.args(parts);
+    cmd.arg(target);
+    cmd
+}
+
+fn load_editor_state(path: &Path) -> Result<TextEditorState, String> {
+    let content = fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let mut lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+    if content.ends_with('\n') || lines.is_empty() {
+        lines.push(String::new());
+    }
+    Ok(TextEditorState {
+        path: path.to_path_buf(),
+        title: path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("editor")
+            .to_string(),
+        lines,
+        row: 0,
+        col: 0,
+        selection_anchor: None,
+        status: None,
+    })
+}
+
+fn save_editor_state(editor: &mut TextEditorState) -> Result<(), String> {
+    let mut content = editor.lines.join("\n");
+    if !content.ends_with('\n') {
+        content.push('\n');
+    }
+    fs::write(&editor.path, content).map_err(|e| e.to_string())?;
+    editor.status = Some("Saved.".to_string());
+    Ok(())
+}
+
+fn pos_le(a: (usize, usize), b: (usize, usize)) -> bool {
+    a.0 < b.0 || (a.0 == b.0 && a.1 <= b.1)
+}
+
+fn selection_bounds(editor: &TextEditorState) -> Option<((usize, usize), (usize, usize))> {
+    let anchor = editor.selection_anchor?;
+    let cursor = (editor.row, editor.col);
+    if anchor == cursor {
+        None
+    } else if pos_le(anchor, cursor) {
+        Some((anchor, cursor))
+    } else {
+        Some((cursor, anchor))
+    }
+}
+
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum ByteClass {
+    Space,
+    Word,
+    Punct,
+}
+
+fn classify_byte(b: u8) -> ByteClass {
+    if b.is_ascii_whitespace() {
+        ByteClass::Space
+    } else if b.is_ascii_alphanumeric() || b == b'_' {
+        ByteClass::Word
+    } else {
+        ByteClass::Punct
+    }
+}
+
+fn move_word_left(editor: &mut TextEditorState) {
+    loop {
+        if editor.col == 0 {
+            if editor.row == 0 {
+                return;
+            }
+            editor.row -= 1;
+            editor.col = editor.lines[editor.row].len();
+            if editor.col == 0 {
+                return;
+            }
+        }
+
+        let line = editor.lines[editor.row].as_bytes();
+        while editor.col > 0 && classify_byte(line[editor.col - 1]) == ByteClass::Space {
+            editor.col -= 1;
+        }
+        if editor.col == 0 {
+            continue;
+        }
+        let class = classify_byte(line[editor.col - 1]);
+        while editor.col > 0 && classify_byte(line[editor.col - 1]) == class {
+            editor.col -= 1;
+        }
+        return;
+    }
+}
+
+fn move_word_right(editor: &mut TextEditorState) {
+    loop {
+        let len = editor.lines[editor.row].len();
+        if editor.col >= len {
+            if editor.row + 1 >= editor.lines.len() {
+                return;
+            }
+            editor.row += 1;
+            editor.col = 0;
+            if editor.lines[editor.row].is_empty() {
+                return;
+            }
+        }
+
+        let line = editor.lines[editor.row].as_bytes();
+        while editor.col < line.len() && classify_byte(line[editor.col]) == ByteClass::Space {
+            editor.col += 1;
+        }
+        if editor.col >= line.len() {
+            continue;
+        }
+        let class = classify_byte(line[editor.col]);
+        while editor.col < line.len() && classify_byte(line[editor.col]) == class {
+            editor.col += 1;
+        }
+        return;
+    }
+}
+
+fn set_selection_mode(editor: &mut TextEditorState, extending: bool) {
+    if extending {
+        if editor.selection_anchor.is_none() {
+            editor.selection_anchor = Some((editor.row, editor.col));
+        }
+    } else {
+        editor.selection_anchor = None;
+    }
+    editor.status = None;
+}
+
+fn clear_selection(editor: &mut TextEditorState) {
+    editor.selection_anchor = None;
+}
+
+fn selected_text(editor: &TextEditorState) -> Option<String> {
+    let ((sr, sc), (er, ec)) = selection_bounds(editor)?;
+    if sr == er {
+        return Some(editor.lines[sr][sc..ec].to_string());
+    }
+    let mut out = String::new();
+    out.push_str(&editor.lines[sr][sc..]);
+    out.push('\n');
+    for row in (sr + 1)..er {
+        out.push_str(&editor.lines[row]);
+        out.push('\n');
+    }
+    out.push_str(&editor.lines[er][..ec]);
+    Some(out)
+}
+
+fn delete_selection(editor: &mut TextEditorState) -> bool {
+    let Some(((sr, sc), (er, ec))) = selection_bounds(editor) else {
+        return false;
+    };
+    if sr == er {
+        editor.lines[sr].replace_range(sc..ec, "");
+    } else {
+        let prefix = editor.lines[sr][..sc].to_string();
+        let suffix = editor.lines[er][ec..].to_string();
+        editor.lines.splice(sr..=er, [format!("{prefix}{suffix}")]);
+    }
+    editor.row = sr;
+    editor.col = sc;
+    clear_selection(editor);
+    true
+}
+
+fn insert_text(editor: &mut TextEditorState, text: &str) {
+    let _ = delete_selection(editor);
+    let parts: Vec<&str> = text.split('\n').collect();
+    if parts.len() == 1 {
+        editor.lines[editor.row].insert_str(editor.col, parts[0]);
+        editor.col += parts[0].len();
+        return;
+    }
+
+    let suffix = editor.lines[editor.row].split_off(editor.col);
+    editor.lines[editor.row].push_str(parts[0]);
+    let row = editor.row;
+    for (i, part) in parts.iter().enumerate().skip(1) {
+        editor.lines.insert(row + i, (*part).to_string());
+    }
+    let last_row = row + parts.len() - 1;
+    editor.lines[last_row].push_str(&suffix);
+    editor.row = last_row;
+    editor.col = parts.last().map(|s| s.len()).unwrap_or(0);
+}
+
+fn duplicate_current_line(editor: &mut TextEditorState) {
+    let line = editor.lines[editor.row].clone();
+    editor.lines.insert(editor.row + 1, line);
+    editor.row += 1;
+    editor.col = 0;
+    clear_selection(editor);
+}
+
+fn delete_current_line(editor: &mut TextEditorState) {
+    if editor.lines.len() == 1 {
+        editor.lines[0].clear();
+    } else {
+        editor.lines.remove(editor.row);
+        if editor.row >= editor.lines.len() {
+            editor.row = editor.lines.len() - 1;
+        }
+    }
+    editor.col = editor.col.min(editor.lines[editor.row].len());
+    clear_selection(editor);
+}
+
 fn git_in(dir: &Path, args: &[&str]) -> Option<String> {
     Command::new("git")
         .current_dir(dir)
@@ -1503,6 +2008,8 @@ impl App {
         }
         let mut setup_ls = ListState::default();
         setup_ls.select(Some(0));
+        let mut pane_ls = ListState::default();
+        pane_ls.select(Some(0));
 
         let prompts = global_prompts.clone();
         let mut app = App {
@@ -1515,6 +2022,9 @@ impl App {
             prompt_state: PromptState::Browse {
                 list_state: prompt_ls,
             },
+            prompt_input: String::new(),
+            prompt_inputting: false,
+            prompt_message: None,
             issues: vec![],
             issue_list_state: ListState::default(),
             issues_error: None,
@@ -1547,6 +2057,9 @@ impl App {
             memory_input: String::new(),
             memory_inputting: false,
             pending_editor: None,
+            text_editor: None,
+            pending_delete: None,
+            pending_command: None,
             skills: vec![],
             skills_list_state: {
                 let mut s = ListState::default();
@@ -1561,6 +2074,8 @@ impl App {
                 s
             },
             mcp_loaded: false,
+            pane_list_state: pane_ls,
+            pane_message: None,
             context: String::new(),
             repo: String::new(),
             async_tx,
@@ -1581,6 +2096,31 @@ impl App {
             ls.select(Some(0));
         }
         self.prompt_state = PromptState::Browse { list_state: ls };
+        self.prompt_message = None;
+    }
+
+    fn reload_project_prompts(&mut self) {
+        if let Some(idx) = self.active_project_idx {
+            if let Some(p) = self.projects.get(idx) {
+                self.project_prompts = load_prompts_from(&p.path.join(".prompts"));
+                if self.prompts_view == PromptsView::Project {
+                    self.prompts = self.project_prompts.clone();
+                }
+            }
+        }
+    }
+
+    fn open_text_editor(&mut self, path: PathBuf) {
+        match load_editor_state(&path) {
+            Ok(editor) => {
+                self.text_editor = Some(editor);
+            }
+            Err(e) => {
+                self.prompt_message = Some(format!("Error: {e}"));
+                self.setup_message = Some(format!("Error: {e}"));
+                self.memory_message = Some(format!("Error: {e}"));
+            }
+        }
     }
 
     fn refresh_setup(&mut self) {
@@ -1592,10 +2132,7 @@ impl App {
                     self.setup_list_state.select(Some(0));
                 }
                 // Reload project prompts in case .prompts/ was just created
-                self.project_prompts = load_prompts_from(&path.join(".prompts"));
-                if self.prompts_view == PromptsView::Project {
-                    self.prompts = self.project_prompts.clone();
-                }
+                self.reload_project_prompts();
             }
         } else {
             self.setup_items = vec![];
@@ -1912,6 +2449,12 @@ const MEMORY_INDEX_TEMPLATE: &str = "# Memory Index\n\nAgent memory for this pro
 // ── Event handling ────────────────────────────────────────────────────────────
 
 fn handle_key(app: &mut App, key: KeyCode, modifiers: KeyModifiers) -> bool {
+    if app.text_editor.is_some() {
+        return handle_text_editor(app, key, modifiers);
+    }
+    if app.pending_delete.is_some() {
+        return handle_delete_confirm(app, key);
+    }
     if key == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL) {
         return true;
     }
@@ -1924,7 +2467,8 @@ fn handle_key(app: &mut App, key: KeyCode, modifiers: KeyModifiers) -> bool {
                 &app.prompt_state,
                 PromptState::Fill { .. } | PromptState::Done(_)
             ) || app.home_edit.is_some()
-                || app.memory_inputting;
+                || app.memory_inputting
+                || app.prompt_inputting;
             if !in_flow {
                 match key {
                     KeyCode::Esc => {
@@ -1996,13 +2540,66 @@ fn handle_key(app: &mut App, key: KeyCode, modifiers: KeyModifiers) -> bool {
                 ProjectTab::Memories => handle_memories(app, key),
                 ProjectTab::Skills => handle_skills(app, key),
                 ProjectTab::Mcp => handle_mcp(app, key),
-                ProjectTab::Pane => false,
+                ProjectTab::Pane => handle_pane(app, key),
             }
         }
     }
 }
 
 fn handle_prompts(app: &mut App, key: KeyCode) -> bool {
+    if app.prompt_inputting {
+        match key {
+            KeyCode::Esc => {
+                app.prompt_inputting = false;
+                app.prompt_input.clear();
+            }
+            KeyCode::Backspace => {
+                app.prompt_input.pop();
+            }
+            KeyCode::Char(c) => {
+                app.prompt_input.push(c);
+            }
+            KeyCode::Enter => {
+                let raw = app.prompt_input.trim().to_string();
+                if !raw.is_empty() {
+                    if let Some(idx) = app.active_project_idx {
+                        if let Some(project) = app.projects.get(idx) {
+                            let dir = project.path.join(".prompts");
+                            let _ = fs::create_dir_all(&dir);
+                            let filename = if raw.ends_with(".md") {
+                                raw.clone()
+                            } else {
+                                format!("{raw}.md")
+                            };
+                            let path = dir.join(&filename);
+                            let title = raw.trim_end_matches(".md");
+                            let body = format!(
+                                "# Prompt: {title}\n\n```\n[describe the task here]\n```\n"
+                            );
+                            match fs::write(&path, body) {
+                                Ok(_) => {
+                                    app.prompt_inputting = false;
+                                    app.prompt_input.clear();
+                                    app.reload_project_prompts();
+                                    app.switch_prompts_view(PromptsView::Project);
+                                    app.pending_editor = Some(path);
+                                    app.prompt_message = None;
+                                }
+                                Err(e) => {
+                                    app.prompt_message = Some(format!("Error: {e}"));
+                                    app.prompt_inputting = false;
+                                    app.prompt_input.clear();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        return false;
+    }
+
     // Subnav: g = global, p = project
     if matches!(&app.prompt_state, PromptState::Browse { .. }) {
         match key {
@@ -2069,6 +2666,56 @@ fn handle_prompts(app: &mut App, key: KeyCode) -> bool {
                             };
                         }
                     }
+                }
+                KeyCode::Char('n') if app.prompts_view == PromptsView::Project => {
+                    app.prompt_inputting = true;
+                    app.prompt_input.clear();
+                    app.prompt_message = None;
+                }
+                KeyCode::Char('e') if app.prompts_view == PromptsView::Project => {
+                    if let Some(idx) = list_state.selected() {
+                        if let Some(project_idx) = app.active_project_idx {
+                            if let Some(project) = app.projects.get(project_idx) {
+                                if let Some(prompt) = app.prompts.get(idx) {
+                                    app.pending_editor = Some(
+                                        project
+                                            .path
+                                            .join(".prompts")
+                                            .join(format!("{}.md", prompt.name)),
+                                    );
+                                    app.prompt_message = None;
+                                }
+                            }
+                        }
+                    }
+                }
+                KeyCode::Char('d') if app.prompts_view == PromptsView::Project => {
+                    if let Some(idx) = list_state.selected() {
+                        if let Some(project_idx) = app.active_project_idx {
+                            if let Some(project) = app.projects.get(project_idx) {
+                                if let Some(prompt) = app.prompts.get(idx) {
+                                    let prompt_name = prompt.name.clone();
+                                    let path = project
+                                        .path
+                                        .join(".prompts")
+                                        .join(format!("{prompt_name}.md"));
+                                    app.pending_delete = Some(DeleteConfirm {
+                                        title: format!("Delete prompt {prompt_name}.md?"),
+                                        detail: path.to_string_lossy().into_owned(),
+                                        target: DeleteTarget::Prompt {
+                                            path,
+                                            name: prompt_name,
+                                        },
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+                KeyCode::Char('r') if app.prompts_view == PromptsView::Project => {
+                    app.reload_project_prompts();
+                    app.switch_prompts_view(PromptsView::Project);
+                    app.prompt_message = None;
                 }
                 _ => {}
             }
@@ -2326,9 +2973,79 @@ fn copy_to_clipboard(text: &str) {
     }
 }
 
+fn centered_rect(width: u16, height: u16, area: ratatui::layout::Rect) -> ratatui::layout::Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Fill(1),
+            Constraint::Length(height.min(area.height)),
+            Constraint::Fill(1),
+        ])
+        .split(area);
+    let horizontal = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Fill(1),
+            Constraint::Length(width.min(area.width)),
+            Constraint::Fill(1),
+        ])
+        .split(vertical[1]);
+    horizontal[1]
+}
+
+fn execute_delete(app: &mut App, confirm: DeleteConfirm) {
+    match confirm.target {
+        DeleteTarget::Prompt { path, name } => match fs::remove_file(&path) {
+            Ok(_) => {
+                app.reload_project_prompts();
+                app.switch_prompts_view(PromptsView::Project);
+                app.prompt_message = Some(format!("Deleted {name}.md"));
+            }
+            Err(e) => {
+                app.prompt_message = Some(format!("Error: {e}"));
+            }
+        },
+        DeleteTarget::Memory { path, name } => match fs::remove_file(&path) {
+            Ok(_) => {
+                app.memory_message = Some(format!("Deleted {name}.md"));
+                app.reload_memories();
+            }
+            Err(e) => {
+                app.memory_message = Some(format!("Error: {e}"));
+            }
+        },
+        DeleteTarget::Setup { project_path, item } => {
+            app.setup_message = Some(
+                apply_setup_item(&project_path, &item, SetupAction::Delete)
+                    .unwrap_or_else(|e| format!("Error: {e}")),
+            );
+            app.refresh_setup();
+        }
+    }
+}
+
+fn handle_delete_confirm(app: &mut App, key: KeyCode) -> bool {
+    match key {
+        KeyCode::Esc | KeyCode::Char('n') => {
+            app.pending_delete = None;
+        }
+        KeyCode::Enter | KeyCode::Char('y') => {
+            if let Some(confirm) = app.pending_delete.take() {
+                execute_delete(app, confirm);
+            }
+        }
+        _ => {}
+    }
+    false
+}
+
 // ── Drawing ───────────────────────────────────────────────────────────────────
 
 fn draw(frame: &mut Frame, app: &App) {
+    if let Some(editor) = &app.text_editor {
+        draw_text_editor(frame, editor);
+        return;
+    }
     match (&app.screen, &app.prompt_state) {
         (
             _,
@@ -2349,6 +3066,9 @@ fn draw(frame: &mut Frame, app: &App) {
         (Screen::InProject(ProjectTab::Skills), _) => draw_skills(frame, app),
         (Screen::InProject(ProjectTab::Mcp), _) => draw_mcp(frame, app),
         (Screen::InProject(ProjectTab::Pane), _) => draw_pane(frame, app),
+    }
+    if let Some(confirm) = &app.pending_delete {
+        draw_delete_confirm(frame, confirm);
     }
 }
 
@@ -2435,7 +3155,7 @@ fn nav_row(app: &App) -> Line<'static> {
             *active_tab == ProjectTab::Home,
         ),
         (I_ISSUES, "issues", 2, *active_tab == ProjectTab::Issues),
-        (I_SETUP, "setup", 3, *active_tab == ProjectTab::Setup),
+        (I_SETUP, "config", 3, *active_tab == ProjectTab::Setup),
         (I_PROMPTS, "prompts", 4, *active_tab == ProjectTab::Prompts),
         (I_MEMORY, "memories", 5, *active_tab == ProjectTab::Memories),
         (I_SKILLS, "skills", 6, *active_tab == ProjectTab::Skills),
@@ -2703,13 +3423,18 @@ fn hl() -> Style {
 
 fn draw_prompts(frame: &mut Frame, app: &App) {
     let area = frame.area();
+    let bottom_h = if app.prompt_inputting || app.prompt_message.is_some() {
+        3
+    } else {
+        1
+    };
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Min(0),
-            Constraint::Length(1),
+            Constraint::Length(bottom_h),
         ])
         .split(area);
 
@@ -2800,18 +3525,47 @@ fn draw_prompts(frame: &mut Frame, app: &App) {
             .wrap(Wrap { trim: false }),
         left_area[1],
     );
-    frame.render_widget(
-        Paragraph::new(footer(&[
-            ("g", "global"),
-            ("p", "project"),
-            ("↑↓/jk", "navigate"),
-            ("enter", "select"),
-            ("esc", "back"),
-            ("tab", "switch"),
-            ("q", "quit"),
-        ])),
-        outer[3],
-    );
+    if app.prompt_inputting {
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("> ", Style::default().fg(ACCENT)),
+                Span::raw(app.prompt_input.clone()),
+                Span::styled("█", Style::default().fg(ACCENT)),
+            ]))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" new prompt name "),
+            ),
+            outer[3],
+        );
+    } else if let Some(msg) = &app.prompt_message {
+        let color = if msg.starts_with("Error:") {
+            C_RED
+        } else {
+            C_GREEN
+        };
+        frame.render_widget(
+            Paragraph::new(Span::styled(format!("  {msg}"), Style::default().fg(color)))
+                .block(Block::default().borders(Borders::ALL)),
+            outer[3],
+        );
+    } else {
+        frame.render_widget(
+            Paragraph::new(footer(&[
+                ("g", "global"),
+                ("p", "project"),
+                ("↑↓/jk", "navigate"),
+                ("enter", "copy/fill"),
+                ("n", "new"),
+                ("e", "edit"),
+                ("d", "delete"),
+                ("r", "reload"),
+                ("esc", "back"),
+            ])),
+            outer[3],
+        );
+    }
 }
 
 fn draw_issues(frame: &mut Frame, app: &App) {
@@ -3262,15 +4016,11 @@ fn handle_memories(app: &mut App, key: KeyCode) -> bool {
                 if let Some(f) = app.memory_files.get(idx) {
                     let path = f.path.clone();
                     let name = f.name.clone();
-                    match fs::remove_file(&path) {
-                        Ok(_) => {
-                            app.memory_message = Some(format!("Deleted {name}.md"));
-                            app.reload_memories();
-                        }
-                        Err(e) => {
-                            app.memory_message = Some(format!("Error: {e}"));
-                        }
-                    }
+                    app.pending_delete = Some(DeleteConfirm {
+                        title: format!("Delete memory {name}.md?"),
+                        detail: path.to_string_lossy().into_owned(),
+                        target: DeleteTarget::Memory { path, name },
+                    });
                 }
             }
         }
@@ -3327,13 +4077,61 @@ fn handle_setup(app: &mut App, key: KeyCode) -> bool {
                     if let Some(p) = app.projects.get(idx) {
                         let path = p.path.clone();
                         let item = app.setup_items[sel].clone();
-                        if item.status != SetupStatus::Ok {
-                            app.setup_message = Some(
-                                apply_setup_item(&path, &item)
-                                    .unwrap_or_else(|e| format!("Error: {e}")),
-                            );
-                            app.refresh_setup();
+                        app.setup_message = Some(
+                            apply_setup_item(&path, &item, SetupAction::Apply)
+                                .unwrap_or_else(|e| format!("Error: {e}")),
+                        );
+                        app.refresh_setup();
+                    }
+                }
+            }
+        }
+        KeyCode::Char('e') => {
+            if let Some(sel) = app.setup_list_state.selected() {
+                if let Some(idx) = app.active_project_idx {
+                    if let Some(p) = app.projects.get(idx) {
+                        let path = p.path.clone();
+                        let item = app.setup_items[sel].clone();
+                        match edit_setup_item(&path, &item) {
+                            Ok(path) => {
+                                app.pending_editor = Some(path);
+                                app.setup_message = None;
+                            }
+                            Err(e) => app.setup_message = Some(format!("Error: {e}")),
                         }
+                    }
+                }
+            }
+        }
+        KeyCode::Char('d') => {
+            if let Some(sel) = app.setup_list_state.selected() {
+                if let Some(idx) = app.active_project_idx {
+                    if let Some(p) = app.projects.get(idx) {
+                        let path = p.path.clone();
+                        let item = app.setup_items[sel].clone();
+                        app.pending_delete = Some(DeleteConfirm {
+                            title: format!("Delete config item {}?", item.label),
+                            detail: item.detail.to_string(),
+                            target: DeleteTarget::Setup {
+                                project_path: path,
+                                item,
+                            },
+                        });
+                    }
+                }
+            }
+        }
+        KeyCode::Char('R') => {
+            if let Some(sel) = app.setup_list_state.selected() {
+                if let Some(idx) = app.active_project_idx {
+                    if let Some(p) = app.projects.get(idx) {
+                        let path = p.path.clone();
+                        let item = app.setup_items[sel].clone();
+                        app.setup_message = Some(
+                            apply_setup_item(&path, &item, SetupAction::Reset)
+                                .unwrap_or_else(|e| format!("Error: {e}")),
+                        );
+                        app.refresh_setup();
                     }
                 }
             }
@@ -3385,7 +4183,7 @@ fn draw_setup(frame: &mut Frame, app: &App) {
                     Style::default().fg(Color::DarkGray),
                 )),
             ])
-            .block(Block::default().borders(Borders::ALL).title(" setup ")),
+            .block(Block::default().borders(Borders::ALL).title(" config ")),
             outer[2],
         );
     } else if app.setup_items.is_empty() {
@@ -3394,7 +4192,7 @@ fn draw_setup(frame: &mut Frame, app: &App) {
                 "  Scanning…",
                 Style::default().fg(Color::DarkGray),
             ))
-            .block(Block::default().borders(Borders::ALL).title(" setup ")),
+            .block(Block::default().borders(Borders::ALL).title(" config ")),
             outer[2],
         );
     } else {
@@ -3416,9 +4214,9 @@ fn draw_setup(frame: &mut Frame, app: &App) {
                     SetupStatus::Stale => (I_WARN, Style::default().fg(C_YELLOW)),
                 };
                 let action_hint = match item.status {
-                    SetupStatus::Ok => "",
-                    SetupStatus::Missing => "  → press enter to apply",
-                    SetupStatus::Stale => "  → press enter to remove",
+                    SetupStatus::Ok => "  enter safe apply  e edit  d delete  R reset",
+                    SetupStatus::Missing => "  enter safe apply  e create+edit  R reset",
+                    SetupStatus::Stale => "  d delete  e edit  R reset",
                 };
                 ListItem::new(Line::from(vec![
                     Span::styled(format!(" {icon}  "), icon_style),
@@ -3432,7 +4230,7 @@ fn draw_setup(frame: &mut Frame, app: &App) {
         let mut ls = app.setup_list_state.clone();
         frame.render_stateful_widget(
             List::new(items)
-                .block(Block::default().borders(Borders::ALL).title(" setup "))
+                .block(Block::default().borders(Borders::ALL).title(" config "))
                 .highlight_style(hl())
                 .highlight_symbol("> "),
             inner[0],
@@ -3440,10 +4238,22 @@ fn draw_setup(frame: &mut Frame, app: &App) {
         );
 
         if let Some(msg) = &app.setup_message {
+            let color = if msg.starts_with("Error:") {
+                C_RED
+            } else {
+                C_GREEN
+            };
             frame.render_widget(
                 Paragraph::new(Span::styled(
-                    format!("  {I_CHECK} {msg}"),
-                    Style::default().fg(C_GREEN),
+                    format!(
+                        "  {} {msg}",
+                        if msg.starts_with("Error:") {
+                            I_CROSS
+                        } else {
+                            I_CHECK
+                        }
+                    ),
+                    Style::default().fg(color),
                 ))
                 .block(Block::default().borders(Borders::ALL)),
                 inner[1],
@@ -3454,7 +4264,10 @@ fn draw_setup(frame: &mut Frame, app: &App) {
     frame.render_widget(
         Paragraph::new(footer(&[
             ("↑↓/jk", "navigate"),
-            ("enter", "apply item"),
+            ("enter", "safe apply"),
+            ("e", "edit"),
+            ("d", "delete"),
+            ("R", "reset default"),
             ("a", "apply all"),
             ("r", "rescan"),
             ("esc", "back"),
@@ -3842,12 +4655,14 @@ fn draw_mcp(frame: &mut Frame, app: &App) {
 
 fn draw_pane(frame: &mut Frame, app: &App) {
     let area = frame.area();
+    let bottom_h = if app.pane_message.is_some() { 3 } else { 0 };
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Min(0),
+            Constraint::Length(bottom_h),
             Constraint::Length(1),
         ])
         .split(area);
@@ -3855,42 +4670,103 @@ fn draw_pane(frame: &mut Frame, app: &App) {
     frame.render_widget(Paragraph::new(header_row(app)), outer[0]);
     frame.render_widget(Paragraph::new(nav_row(app)), outer[1]);
 
-    let inner = Block::default().borders(Borders::ALL).title(" pane ");
-    let content_area = inner.inner(outer[2]);
-    frame.render_widget(inner, outer[2]);
-
-    let h = content_area.height as usize;
-    let w = content_area.width as usize;
-
-    // Center the placeholder art vertically
-    let art: &[&str] = &[
-        r"  _  _  _  _ ",
-        r" |            ",
-        r" |_   _ |\|  /",
-        r" |   / \| |\/",
-        r" |  |___| |  \",
-        r"              ",
-        r" child pane   ",
-        r"              ",
-        r" yazi · helix · … ",
-    ];
-    let art_h = art.len();
-    let pad_top = h.saturating_sub(art_h) / 2;
-
-    let mut lines: Vec<Line> = (0..pad_top).map(|_| Line::from("")).collect();
-    for row in art {
-        let pad_left = w.saturating_sub(row.len()) / 2;
-        lines.push(Line::from(Span::styled(
-            format!("{:pad_left$}{row}", ""),
-            Style::default().fg(FG_DIM),
-        )));
-    }
-
-    frame.render_widget(Paragraph::new(lines), content_area);
-    frame.render_widget(
-        Paragraph::new(footer(&[("esc", "back"), ("tab", "switch"), ("q", "quit")])),
-        outer[3],
+    let main = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
+        .split(outer[2]);
+    let items = vec![ListItem::new("lazygit"), ListItem::new("yazi")];
+    let mut ls = app.pane_list_state.clone();
+    frame.render_stateful_widget(
+        List::new(items)
+            .block(Block::default().borders(Borders::ALL).title(" tools "))
+            .highlight_style(hl())
+            .highlight_symbol("> "),
+        main[0],
+        &mut ls,
     );
+    let detail = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  lazygit", Style::default().fg(Color::White)),
+            Span::styled("  open repo git UI", Style::default().fg(FG_DIM)),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  yazi", Style::default().fg(Color::White)),
+            Span::styled("  browse project files", Style::default().fg(FG_DIM)),
+        ]),
+    ];
+    frame.render_widget(
+        Paragraph::new(detail).block(Block::default().borders(Borders::ALL).title(" detail ")),
+        main[1],
+    );
+    if let Some(msg) = &app.pane_message {
+        let color = if msg.starts_with("Error:") {
+            C_RED
+        } else {
+            C_GREEN
+        };
+        frame.render_widget(
+            Paragraph::new(Span::styled(format!("  {msg}"), Style::default().fg(color)))
+                .block(Block::default().borders(Borders::ALL)),
+            outer[3],
+        );
+    }
+    frame.render_widget(
+        Paragraph::new(footer(&[
+            ("↑↓/jk", "navigate"),
+            ("enter", "launch"),
+            ("esc", "back"),
+            ("tab", "switch"),
+            ("q", "quit"),
+        ])),
+        outer[4],
+    );
+}
+
+fn handle_pane(app: &mut App, key: KeyCode) -> bool {
+    const PANE_ITEMS: [&str; 2] = ["lazygit", "yazi"];
+    match key {
+        KeyCode::Down | KeyCode::Char('j') => {
+            let n = (app.pane_list_state.selected().unwrap_or(0) + 1) % PANE_ITEMS.len();
+            app.pane_list_state.select(Some(n));
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            let len = PANE_ITEMS.len();
+            let n = app
+                .pane_list_state
+                .selected()
+                .map(|i| if i == 0 { len - 1 } else { i - 1 })
+                .unwrap_or(0);
+            app.pane_list_state.select(Some(n));
+        }
+        KeyCode::Enter => {
+            if let Some(idx) = app.pane_list_state.selected() {
+                if let Some(project_idx) = app.active_project_idx {
+                    if let Some(project) = app.projects.get(project_idx) {
+                        let cwd = project.path.clone();
+                        let command = match PANE_ITEMS[idx] {
+                            "lazygit" => ExternalCommand {
+                                program: "lazygit".to_string(),
+                                args: vec![],
+                                cwd,
+                            },
+                            "yazi" => ExternalCommand {
+                                program: "yazi".to_string(),
+                                args: vec![cwd.to_string_lossy().into_owned()],
+                                cwd,
+                            },
+                            _ => return false,
+                        };
+                        app.pending_command = Some(command);
+                        app.pane_message = None;
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    false
 }
 
 fn handle_skills(app: &mut App, key: KeyCode) -> bool {
@@ -3937,6 +4813,258 @@ fn handle_mcp(app: &mut App, key: KeyCode) -> bool {
         _ => {}
     }
     false
+}
+
+fn handle_text_editor(app: &mut App, key: KeyCode, modifiers: KeyModifiers) -> bool {
+    let Some(editor) = &mut app.text_editor else {
+        return false;
+    };
+    let primary = modifiers.contains(KeyModifiers::CONTROL)
+        || modifiers.contains(KeyModifiers::SUPER)
+        || modifiers.contains(KeyModifiers::META);
+
+    let clamp_col = |editor: &mut TextEditorState| {
+        let len = editor.lines.get(editor.row).map(|l| l.len()).unwrap_or(0);
+        editor.col = editor.col.min(len);
+    };
+
+    match key {
+        KeyCode::Esc => {
+            if selection_bounds(editor).is_some() {
+                clear_selection(editor);
+            } else {
+                app.text_editor = None;
+                app.reload_memories();
+                app.reload_project_prompts();
+            }
+        }
+        KeyCode::Char('s') if primary => {
+            let _ = save_editor_state(editor);
+            app.reload_memories();
+            app.reload_project_prompts();
+            app.refresh_setup();
+        }
+        KeyCode::Char('c') if primary => {
+            if let Some(text) = selected_text(editor) {
+                if let Ok(mut cb) = Clipboard::new() {
+                    let _ = cb.set_text(text);
+                    editor.status = Some("Copied.".to_string());
+                }
+            }
+        }
+        KeyCode::Char('x') if primary => {
+            if let Some(text) = selected_text(editor) {
+                if let Ok(mut cb) = Clipboard::new() {
+                    let _ = cb.set_text(text);
+                }
+                let _ = delete_selection(editor);
+                editor.status = Some("Cut.".to_string());
+            }
+        }
+        KeyCode::Char('v') if primary => {
+            if let Ok(mut cb) = Clipboard::new() {
+                if let Ok(text) = cb.get_text() {
+                    insert_text(editor, &text);
+                    editor.status = Some("Pasted.".to_string());
+                }
+            }
+        }
+        KeyCode::Char('d') if primary => {
+            duplicate_current_line(editor);
+        }
+        KeyCode::Char('k') if primary => {
+            delete_current_line(editor);
+        }
+        KeyCode::Left if modifiers.contains(KeyModifiers::ALT) => {
+            set_selection_mode(editor, modifiers.contains(KeyModifiers::SHIFT));
+            move_word_left(editor);
+        }
+        KeyCode::Right if modifiers.contains(KeyModifiers::ALT) => {
+            set_selection_mode(editor, modifiers.contains(KeyModifiers::SHIFT));
+            move_word_right(editor);
+        }
+        KeyCode::Up => {
+            set_selection_mode(editor, modifiers.contains(KeyModifiers::SHIFT));
+            if editor.row > 0 {
+                editor.row -= 1;
+                clamp_col(editor);
+            }
+        }
+        KeyCode::Down => {
+            set_selection_mode(editor, modifiers.contains(KeyModifiers::SHIFT));
+            if editor.row + 1 < editor.lines.len() {
+                editor.row += 1;
+                clamp_col(editor);
+            }
+        }
+        KeyCode::Left => {
+            set_selection_mode(editor, modifiers.contains(KeyModifiers::SHIFT));
+            if editor.col > 0 {
+                editor.col -= 1;
+            } else if editor.row > 0 {
+                editor.row -= 1;
+                editor.col = editor.lines[editor.row].len();
+            }
+        }
+        KeyCode::Right => {
+            set_selection_mode(editor, modifiers.contains(KeyModifiers::SHIFT));
+            let len = editor.lines[editor.row].len();
+            if editor.col < len {
+                editor.col += 1;
+            } else if editor.row + 1 < editor.lines.len() {
+                editor.row += 1;
+                editor.col = 0;
+            }
+        }
+        KeyCode::Backspace | KeyCode::Delete => {
+            if delete_selection(editor) {
+                return false;
+            }
+            set_selection_mode(editor, false);
+            if editor.col > 0 {
+                let line = &mut editor.lines[editor.row];
+                line.remove(editor.col - 1);
+                editor.col -= 1;
+            } else if editor.row > 0 {
+                let current = editor.lines.remove(editor.row);
+                editor.row -= 1;
+                editor.col = editor.lines[editor.row].len();
+                editor.lines[editor.row].push_str(&current);
+            }
+        }
+        KeyCode::Enter => {
+            insert_text(editor, "\n");
+        }
+        KeyCode::Char(c) if !primary => {
+            insert_text(editor, &c.to_string());
+        }
+        _ => {}
+    }
+    false
+}
+
+fn draw_text_editor(frame: &mut Frame, editor: &TextEditorState) {
+    let area = frame.area();
+    let outer = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                " 🐧 pm ",
+                Style::default()
+                    .fg(SEL_FG)
+                    .bg(ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(&editor.title, Style::default().fg(Color::White)),
+        ])),
+        outer[0],
+    );
+
+    let height = outer[1].height.saturating_sub(2) as usize;
+    let start = editor.row.saturating_sub(height.saturating_sub(1));
+    let end = (start + height).min(editor.lines.len());
+    let selection = selection_bounds(editor);
+    let mut lines: Vec<Line> = Vec::new();
+    for idx in start..end {
+        let line = &editor.lines[idx];
+        let mut spans: Vec<Span> = Vec::new();
+        let line_len = line.len();
+        let sel_range = selection.and_then(|((sr, sc), (er, ec))| {
+            if idx < sr || idx > er {
+                None
+            } else {
+                Some((
+                    if idx == sr { sc.min(line_len) } else { 0 },
+                    if idx == er {
+                        ec.min(line_len)
+                    } else {
+                        line_len
+                    },
+                ))
+            }
+        });
+        let mut chars: Vec<(usize, char)> = line.char_indices().collect();
+        chars.push((line_len, '\0'));
+        for window in chars.windows(2) {
+            let byte_idx = window[0].0;
+            let ch = window[0].1;
+            let next_byte_idx = window[1].0;
+            if idx == editor.row && byte_idx == editor.col.min(line_len) {
+                let selected = sel_range
+                    .map(|(s, e)| byte_idx >= s && byte_idx < e)
+                    .unwrap_or(false);
+                let style = if selected {
+                    Style::default().fg(SEL_FG).bg(ACCENT)
+                } else {
+                    Style::default().fg(ACCENT)
+                };
+                spans.push(Span::styled("█", style));
+            }
+            if ch != '\0' {
+                let selected = sel_range
+                    .map(|(s, e)| byte_idx < e && next_byte_idx > s)
+                    .unwrap_or(false);
+                let mut style = Style::default();
+                if selected {
+                    style = style.bg(C_PURPLE).fg(Color::Black);
+                }
+                spans.push(Span::styled(ch.to_string(), style));
+            }
+        }
+        if idx == editor.row && editor.col >= line_len {
+            let selected = sel_range
+                .map(|(s, e)| line_len >= s && line_len < e)
+                .unwrap_or(false);
+            let style = if selected {
+                Style::default().fg(SEL_FG).bg(ACCENT)
+            } else {
+                Style::default().fg(ACCENT)
+            };
+            spans.push(Span::styled("█", style));
+        }
+        lines.push(Line::from(spans));
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled("█", Style::default().fg(ACCENT))));
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::default().borders(Borders::ALL).title(" editor "))
+            .wrap(Wrap { trim: false }),
+        outer[1],
+    );
+
+    let footer_text = if let Some(status) = &editor.status {
+        footer(&[("Ctrl+S", "save"), ("esc", "close")])
+            .spans
+            .into_iter()
+            .chain(vec![Span::styled(
+                format!("  {status}"),
+                Style::default().fg(C_GREEN),
+            )])
+            .collect::<Vec<_>>()
+    } else {
+        footer(&[
+            ("Ctrl+S", "save"),
+            ("esc", "close"),
+            ("←→↑↓", "move"),
+            ("Opt+←→", "jump word"),
+            ("Opt+Shift+←→", "select by word"),
+            ("enter", "newline"),
+            ("backspace", "delete"),
+        ])
+        .spans
+    };
+    frame.render_widget(Paragraph::new(Line::from(footer_text)), outer[2]);
 }
 
 fn draw_fill(
@@ -4069,6 +5197,50 @@ fn draw_done(frame: &mut Frame, text: &str) {
     );
 }
 
+fn draw_delete_confirm(frame: &mut Frame, confirm: &DeleteConfirm) {
+    let area = frame.area();
+    let popup = centered_rect(62, 9, area);
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" confirm delete ")
+            .style(Style::default().bg(Color::Black)),
+        popup,
+    );
+    let inner = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .margin(1)
+        .split(popup);
+    frame.render_widget(
+        Paragraph::new(Span::styled(&confirm.title, Style::default().fg(C_RED))),
+        inner[0],
+    );
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            &confirm.detail,
+            Style::default().fg(Color::White),
+        )),
+        inner[1],
+    );
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            "This cannot be undone from pemguin.",
+            Style::default().fg(FG_DIM),
+        )),
+        inner[2],
+    );
+    frame.render_widget(
+        Paragraph::new(footer(&[("y/enter", "delete"), ("n/esc", "cancel")])),
+        inner[3],
+    );
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 fn main() -> io::Result<()> {
@@ -4091,24 +5263,42 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
         app.process_async_results();
         terminal.draw(|f| draw(f, app))?;
 
-        // Open editor if requested (suspends TUI, resumes after)
         if let Some(path) = app.pending_editor.take() {
-            let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
+            app.open_text_editor(path);
+            continue;
+        }
+        if let Some(command) = app.pending_command.take() {
             disable_raw_mode()?;
             execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-            let _ = Command::new(&editor).arg(&path).status();
+            let result = Command::new(&command.program)
+                .current_dir(&command.cwd)
+                .args(&command.args)
+                .status();
             enable_raw_mode()?;
             execute!(terminal.backend_mut(), EnterAlternateScreen)?;
             terminal.clear()?;
-            app.reload_memories();
+            app.refresh_setup();
+            app.pane_message = match result {
+                Ok(status) if status.success() => Some("Tool exited.".to_string()),
+                Ok(status) => Some(format!("Error: exited with status {status}")),
+                Err(e) => Some(format!("Error: {e}")),
+            };
             continue;
         }
 
         if event::poll(Duration::from_millis(50))? {
-            if let Event::Key(key) = event::read()? {
-                if handle_key(app, key.code, key.modifiers) {
-                    break;
+            match event::read()? {
+                Event::Key(key) => {
+                    if handle_key(app, key.code, key.modifiers) {
+                        break;
+                    }
                 }
+                Event::Paste(text) => {
+                    if let Some(editor) = &mut app.text_editor {
+                        insert_text(editor, &text);
+                    }
+                }
+                _ => {}
             }
         }
     }

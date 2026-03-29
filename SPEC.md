@@ -38,7 +38,7 @@ Feature source of truth. Update this when features ship, change, or get cut.
 - 📋 Create issue from within pm
 - 📋 Close / comment on issue
 
-## Setup Tab
+## Config Tab
 
 - ✅ Check for AGENT.md / CLAUDE.md
 - ✅ Check for SPEC.md
@@ -46,6 +46,9 @@ Feature source of truth. Update this when features ship, change, or get cut.
 - ✅ Check for skills-lock.json
 - ✅ Check for stale AGENTS.md (old format)
 - ✅ Apply missing items on enter
+- ✅ Edit managed items via `e`
+- ✅ Delete managed items via `d`
+- ✅ Reset managed items to pemguin defaults via `R`
 - ✅ Apply all on `a`
 - ✅ Rescan on `r`
 - 📋 Check for CONSTITUTION.md symlink
@@ -89,7 +92,7 @@ Feature source of truth. Update this when features ship, change, or get cut.
 
 ## Pane Tab (tab 8)
 
-- ✅ Placeholder with ASCII art
+- ✅ Launch `lazygit`, `yazi`, and `$EDITOR` in the project root
 - 📋 Embedded child TUI via `tui-term` PTY
 - 📋 Yazi file browser as first child
 - 📋 `Ctrl+W` to toggle focus between pane and pm nav
@@ -117,7 +120,7 @@ Feature source of truth. Update this when features ship, change, or get cut.
 
 ## Known Issues
 
-- All data loads are synchronous — the UI freezes briefly on project open and GitHub sync
+- Full rescan resets list selection instead of preserving the current project focus
 - `gh` errors surface as status messages but don't retry
 - Pane tab is non-functional (placeholder only)
 - Nerd Font glyphs render as boxes in terminals without Nerd Font support

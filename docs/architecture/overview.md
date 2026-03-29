@@ -13,7 +13,7 @@ Screen::Projects          — root project list
 Screen::InProject(tab)    — drilled into a project, showing one of 8 tabs
 ```
 
-Tab variants: `Home | Issues | Setup | Prompts | Memories | Skills | Mcp | Pane`
+Tab variants: `Home | Issues | Config | Prompts | Memories | Skills | Mcp | Pane`
 
 ## Application State (`App`)
 
@@ -24,7 +24,7 @@ Key fields:
 - `project_entries: Vec<ProjectEntry>` — flat render list (Group headers + Item indices)
 - `repo: String` — active project's `owner/repo` slug
 - `context: String` — `"owner/repo (branch)"` used for prompt auto-fill
-- Per-tab state: `issue_list_state`, `setup_items`, `prompt_state`, `memory_files`, `skills`, `mcp_servers`, etc.
+- Per-tab state: `issue_list_state`, `setup_items`, `prompt_state`, `memory_files`, `skills`, `mcp_servers`, pane launcher state, etc.
 
 ## Layout
 
@@ -33,7 +33,7 @@ Every InProject screen uses a 2-row header:
 ```
 ┌──────────────────────────────────────────┐
 │  header row: 🐧 pm  repo-name  branch    │  ← identity
-│  nav row:  1 home  2 issues  3 setup …   │  ← tabs
+│  nav row:  1 home  2 issues  3 config …  │  ← tabs
 ├──────────────────────────────────────────┤
 │  content area (Min(0))                   │
 ├──────────────────────────────────────────┤
@@ -81,6 +81,12 @@ App::open_project(idx)
   → scan_setup()             — filesystem checks
   → spawn background Home hydrate (gh repo view + avatar)
   → defer Issues / Memories / Skills / MCP until tab visit
+
+Config item actions
+  → enter                     — safe apply if missing
+  → e                         — edit current or default file via $EDITOR
+  → d                         — delete/remove managed item
+  → R                         — reset managed item to pemguin default
 ```
 
 Background work returns through an internal async result channel that is polled from the main event loop. The UI renders loading states while Home, Issues, avatar, or project scans are in flight.
@@ -91,4 +97,4 @@ Prompts are Markdown files. Placeholders use `{PLACEHOLDER}` syntax. `auto_value
 
 ## Pane Tab
 
-Tab 8 is a reserved placeholder. The intent is to embed a child TUI (Yazi, Helix) via `tui-term` (PTY emulator widget). `Ctrl+W` is reserved for focus handoff between the pane and pemguin nav. Not yet implemented.
+Tab 8 is currently a launcher for project-scoped external tools. It suspends the TUI, runs `lazygit`, `yazi`, or `$EDITOR` in the repo root, then resumes pm when the child process exits. The longer-term direction is still an embedded PTY-backed pane.
