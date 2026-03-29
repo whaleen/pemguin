@@ -54,7 +54,7 @@ const I_MCP: &str = "\u{f0c1}"; // link/chain
 const I_PANE: &str = "\u{f120}"; // >_ terminal prompt
 const I_SESSIONS: &str = "\u{f017}"; // clock
 
-const GITIGNORE_BLOCK: &str = "\n# Agent dirs\n.agents/\n.claude/\n.kiro/\n.vite-hooks/\nskills-lock.json\nCLAUDE.md\nGEMINI.md\n.memory/\n";
+const GITIGNORE_BLOCK: &str = "\n# Pemguin TUI\n.agents/\n.claude/\n.vite-hooks/\nskills-lock.json\nCLAUDE.md\nGEMINI.md\n.memory/\n";
 const PEMGUIN_PROJECT_CONFIG_TEMPLATE: &str = "[setup]\nignore = []\ndisable = []\n";
 
 // ── Config ────────────────────────────────────────────────────────────────────
@@ -494,7 +494,7 @@ fn scan_setup(path: &Path) -> Vec<SetupItem> {
     };
     let docs_ok = path.join("docs").is_dir();
     let gitignore_ok = fs::read_to_string(path.join(".gitignore"))
-        .map(|s| s.contains("# Agent dirs"))
+        .map(|s| s.contains("# Pemguin TUI") || s.contains("# Agent dirs"))
         .unwrap_or(false);
     let agents_stale = path.join("AGENTS.md").exists();
     let prompts_ok = path.join(".prompts").is_dir();
@@ -620,7 +620,11 @@ fn remove_gitignore_block(project_path: &Path) -> Result<(), String> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e.to_string()),
     };
-    let next = content.replace(GITIGNORE_BLOCK, "\n");
+    // Remove current block heading and legacy "# Agent dirs" heading
+    let legacy = GITIGNORE_BLOCK.replace("# Pemguin TUI", "# Agent dirs");
+    let next = content
+        .replace(GITIGNORE_BLOCK, "\n")
+        .replace(&legacy, "\n");
     fs::write(&gitignore, next).map_err(|e| e.to_string())
 }
 
@@ -719,7 +723,7 @@ fn apply_setup_item(
             }
         },
         "docs/" => {
-            let src = pemguin_dir.join("docs");
+            let src = pemguin_dir.join("templates").join("docs");
             let dst = project_path.join("docs");
             match action {
                 SetupAction::Delete => fs::remove_dir_all(&dst)
@@ -768,7 +772,7 @@ fn apply_setup_item(
             SetupAction::Apply => {
                 let gitignore = project_path.join(".gitignore");
                 let current = fs::read_to_string(&gitignore).unwrap_or_default();
-                if current.contains("# Agent dirs") {
+                if current.contains("# Pemguin TUI") || current.contains("# Agent dirs") {
                     return Ok(".gitignore already patched — skipped".to_string());
                 }
                 let mut f = fs::OpenOptions::new()

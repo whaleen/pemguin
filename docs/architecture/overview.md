@@ -13,7 +13,7 @@ Screen::Projects          — root project list
 Screen::InProject(tab)    — drilled into a project, showing one of 8 tabs
 ```
 
-Tab variants: `Home | Issues | Config | Prompts | Memories | Skills | Mcp | Pane`
+Tab variants: `Home | Issues | Config | Prompts | Memories | Skills | Mcp | Pane | Sessions`
 
 ## Application State (`App`)
 
@@ -98,3 +98,7 @@ Prompts are Markdown files. Placeholders use `{PLACEHOLDER}` syntax. `auto_value
 ## Pane Tab
 
 Tab 8 is currently a launcher for project-scoped external tools. It suspends the TUI, runs `lazygit`, `yazi`, or `$EDITOR` in the repo root, then resumes pm when the child process exits. The longer-term direction is still an embedded PTY-backed pane.
+
+## Sessions Tab
+
+Tab 9 lists per-project agent sessions (Claude Code, Codex). Sessions are persisted to `.pemguin/sessions.toml`. Claude sessions are imported from `~/.claude/projects/`, Codex from `~/.codex/sessions/YYYY/MM/DD/`. Session IDs are nullable — present when resolved locally, absent when pending. Exports go to `.pemguin/exports/` as markdown and plain text.

@@ -1,6 +1,6 @@
 cli/target/
 
-# Agent dirs
+# Pemguin TUI
 .agents/
 .claude/
 .vite-hooks/
