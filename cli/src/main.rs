@@ -55,7 +55,7 @@ const I_PANE: &str = "\u{f120}"; // >_ terminal prompt
 const I_SESSIONS: &str = "\u{f017}"; // clock
 
 const GITIGNORE_BLOCK: &str = "\n# Pemguin TUI\n.agents/\n.claude/\n.vite-hooks/\nskills-lock.json\nCLAUDE.md\nGEMINI.md\n.memory/\n";
-const PEMGUIN_PROJECT_CONFIG_TEMPLATE: &str = "[setup]\nignore = []\ndisable = []\n";
+const PEMGUIN_PROJECT_CONFIG_TEMPLATE: &str = "[setup]\nskip = []\nblock = []\n";
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -65,18 +65,40 @@ struct Config {
     projects: ProjectsConfig,
 }
 
-#[derive(Clone, serde::Deserialize, Default)]
+#[derive(Clone, serde::Deserialize, serde::Serialize, Default)]
 struct ProjectPemguinConfig {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "ProjectProjectConfig::is_empty")]
+    project: ProjectProjectConfig,
+    #[serde(default, skip_serializing_if = "ProjectSetupConfig::is_empty")]
     setup: ProjectSetupConfig,
 }
 
-#[derive(Clone, serde::Deserialize, Default)]
+#[derive(Clone, serde::Deserialize, serde::Serialize, Default)]
+struct ProjectProjectConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stack: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    agents: Vec<String>,
+}
+
+impl ProjectProjectConfig {
+    fn is_empty(&self) -> bool {
+        self.stack.is_none() && self.agents.is_empty()
+    }
+}
+
+#[derive(Clone, serde::Deserialize, serde::Serialize, Default)]
 struct ProjectSetupConfig {
-    #[serde(default)]
-    ignore: Vec<String>,
-    #[serde(default)]
-    disable: Vec<String>,
+    #[serde(default, alias = "ignore", skip_serializing_if = "Vec::is_empty")]
+    skip: Vec<String>,
+    #[serde(default, alias = "disable", skip_serializing_if = "Vec::is_empty")]
+    block: Vec<String>,
+}
+
+impl ProjectSetupConfig {
+    fn is_empty(&self) -> bool {
+        self.skip.is_empty() && self.block.is_empty()
+    }
 }
 
 #[derive(Clone, serde::Deserialize, Default)]
@@ -470,18 +492,113 @@ struct SetupItem {
     label: &'static str,
     detail: &'static str,
     status: SetupStatus,
+    gitignore_path: Option<&'static str>,  // entry in .gitignore, None if not toggleable
+    gitignored: bool,                       // currently present in # Pemguin TUI block
 }
 
-fn setup_item_ignored(cfg: &ProjectPemguinConfig, label: &str) -> bool {
-    cfg.setup.ignore.iter().any(|s| s == label)
+fn setup_item_skipped(cfg: &ProjectPemguinConfig, label: &str) -> bool {
+    cfg.setup.skip.iter().any(|s| s == label)
 }
 
-fn setup_item_disabled(cfg: &ProjectPemguinConfig, label: &str) -> bool {
-    cfg.setup.disable.iter().any(|s| s == label)
+fn setup_item_blocked(cfg: &ProjectPemguinConfig, label: &str) -> bool {
+    cfg.setup.block.iter().any(|s| s == label)
+}
+
+const KNOWN_SETUP_LABELS: &[&str] = &[
+    "AGENT.md",
+    "SPEC.md",
+    "CLAUDE.md → AGENT.md",
+    "GEMINI.md → AGENT.md",
+    "docs/",
+    ".gitignore",
+    ".prompts/",
+    ".memory/",
+    ".pemguin/",
+    ".pemguin.toml",
+];
+
+const KNOWN_AGENTS: &[&str] = &["claude", "codex", "gemini"];
+
+#[derive(Clone)]
+enum TomlRow {
+    Section(String),
+    TextField { field: &'static str, label: &'static str, value: String },
+    Checkbox { section: &'static str, field: &'static str, label: &'static str, checked: bool },
+}
+
+impl TomlRow {
+    fn is_focusable(&self) -> bool {
+        !matches!(self, TomlRow::Section(_))
+    }
+}
+
+struct TomlEditorState {
+    project_path: PathBuf,
+    config: ProjectPemguinConfig,
+    cursor: usize,     // index into focusable rows only
+    text_input: Option<String>,
+    text_field: Option<&'static str>,
+    message: Option<String>,
+}
+
+fn toml_rows(config: &ProjectPemguinConfig) -> Vec<TomlRow> {
+    let mut rows = vec![];
+
+    rows.push(TomlRow::Section("[project]".to_string()));
+    rows.push(TomlRow::TextField {
+        field: "stack",
+        label: "stack",
+        value: config.project.stack.clone().unwrap_or_default(),
+    });
+    rows.push(TomlRow::Section("  agents:".to_string()));
+    for agent in KNOWN_AGENTS {
+        rows.push(TomlRow::Checkbox {
+            section: "project",
+            field: "agents",
+            label: agent,
+            checked: config.project.agents.contains(&agent.to_string()),
+        });
+    }
+
+    rows.push(TomlRow::Section("[setup] skip — hide from score".to_string()));
+    for label in KNOWN_SETUP_LABELS {
+        rows.push(TomlRow::Checkbox {
+            section: "setup",
+            field: "skip",
+            label,
+            checked: config.setup.skip.contains(&label.to_string()),
+        });
+    }
+
+    rows.push(TomlRow::Section("[setup] block — refuse to apply".to_string()));
+    for label in KNOWN_SETUP_LABELS {
+        rows.push(TomlRow::Checkbox {
+            section: "setup",
+            field: "block",
+            label,
+            checked: config.setup.block.contains(&label.to_string()),
+        });
+    }
+
+    rows
+}
+
+fn focusable_indices(rows: &[TomlRow]) -> Vec<usize> {
+    rows.iter()
+        .enumerate()
+        .filter_map(|(i, r)| if r.is_focusable() { Some(i) } else { None })
+        .collect()
+}
+
+fn save_pemguin_toml(project_path: &Path, config: &ProjectPemguinConfig) -> Result<(), String> {
+    let path = project_path.join(".pemguin.toml");
+    let content = toml::to_string_pretty(config).map_err(|e| e.to_string())?;
+    fs::write(&path, content).map_err(|e| e.to_string())
 }
 
 fn scan_setup(path: &Path) -> Vec<SetupItem> {
     let cfg = load_project_pemguin_config(path);
+    let gitignored = read_gitignore_block_entries(path);
     let agent_ok = path.join("AGENT.md").exists();
     let spec_ok = path.join("SPEC.md").exists();
     let claude_ok = {
@@ -499,6 +616,7 @@ fn scan_setup(path: &Path) -> Vec<SetupItem> {
     let agents_stale = path.join("AGENTS.md").exists();
     let prompts_ok = path.join(".prompts").is_dir();
     let memory_ok = path.join(".memory").join("MEMORY.md").exists();
+    let pemguin_dir_ok = path.join(".pemguin").is_dir();
     let pemguin_cfg_ok = path.join(".pemguin.toml").exists();
 
     let mut items = vec![
@@ -510,6 +628,8 @@ fn scan_setup(path: &Path) -> Vec<SetupItem> {
             } else {
                 SetupStatus::Missing
             },
+            gitignore_path: None,
+            gitignored: false,
         },
         SetupItem {
             label: "SPEC.md",
@@ -519,6 +639,8 @@ fn scan_setup(path: &Path) -> Vec<SetupItem> {
             } else {
                 SetupStatus::Missing
             },
+            gitignore_path: None,
+            gitignored: false,
         },
         SetupItem {
             label: "CLAUDE.md → AGENT.md",
@@ -528,6 +650,8 @@ fn scan_setup(path: &Path) -> Vec<SetupItem> {
             } else {
                 SetupStatus::Missing
             },
+            gitignore_path: Some("CLAUDE.md"),
+            gitignored: gitignored.contains(&"CLAUDE.md".to_string()),
         },
         SetupItem {
             label: "GEMINI.md → AGENT.md",
@@ -537,6 +661,8 @@ fn scan_setup(path: &Path) -> Vec<SetupItem> {
             } else {
                 SetupStatus::Missing
             },
+            gitignore_path: Some("GEMINI.md"),
+            gitignored: gitignored.contains(&"GEMINI.md".to_string()),
         },
         SetupItem {
             label: "docs/",
@@ -546,6 +672,8 @@ fn scan_setup(path: &Path) -> Vec<SetupItem> {
             } else {
                 SetupStatus::Missing
             },
+            gitignore_path: None,
+            gitignored: false,
         },
         SetupItem {
             label: ".gitignore",
@@ -555,6 +683,8 @@ fn scan_setup(path: &Path) -> Vec<SetupItem> {
             } else {
                 SetupStatus::Missing
             },
+            gitignore_path: None,
+            gitignored: false,
         },
         SetupItem {
             label: ".prompts/",
@@ -564,6 +694,8 @@ fn scan_setup(path: &Path) -> Vec<SetupItem> {
             } else {
                 SetupStatus::Missing
             },
+            gitignore_path: Some(".prompts/"),
+            gitignored: gitignored.contains(&".prompts/".to_string()),
         },
         SetupItem {
             label: ".memory/",
@@ -573,6 +705,15 @@ fn scan_setup(path: &Path) -> Vec<SetupItem> {
             } else {
                 SetupStatus::Missing
             },
+            gitignore_path: Some(".memory/"),
+            gitignored: gitignored.contains(&".memory/".to_string()),
+        },
+        SetupItem {
+            label: ".pemguin/",
+            detail: "sessions, exports, local state",
+            status: if pemguin_dir_ok { SetupStatus::Ok } else { SetupStatus::Missing },
+            gitignore_path: Some(".pemguin/"),
+            gitignored: gitignored.contains(&".pemguin/".to_string()),
         },
         SetupItem {
             label: ".pemguin.toml",
@@ -582,6 +723,8 @@ fn scan_setup(path: &Path) -> Vec<SetupItem> {
             } else {
                 SetupStatus::Missing
             },
+            gitignore_path: None,
+            gitignored: false,
         },
     ];
     if agents_stale {
@@ -589,10 +732,12 @@ fn scan_setup(path: &Path) -> Vec<SetupItem> {
             label: "AGENTS.md",
             detail: "stale file — delete it",
             status: SetupStatus::Stale,
+            gitignore_path: None,
+            gitignored: false,
         });
     }
     items.retain(|item| {
-        !setup_item_ignored(&cfg, item.label) && !setup_item_disabled(&cfg, item.label)
+        !setup_item_skipped(&cfg, item.label) && !setup_item_blocked(&cfg, item.label)
     });
     items
 }
@@ -628,15 +773,107 @@ fn remove_gitignore_block(project_path: &Path) -> Result<(), String> {
     fs::write(&gitignore, next).map_err(|e| e.to_string())
 }
 
+fn read_gitignore_block_entries(project_path: &Path) -> Vec<String> {
+    let content = fs::read_to_string(project_path.join(".gitignore")).unwrap_or_default();
+    let mut in_block = false;
+    let mut entries = Vec::new();
+    for line in content.lines() {
+        if line == "# Pemguin TUI" || line == "# Agent dirs" {
+            in_block = true;
+            continue;
+        }
+        if in_block {
+            if line.starts_with('#') || line.is_empty() {
+                break;
+            }
+            entries.push(line.trim().to_string());
+        }
+    }
+    entries
+}
+
+fn toggle_gitignore_entry(project_path: &Path, entry: &str, add: bool) -> Result<String, String> {
+    let gitignore = project_path.join(".gitignore");
+    let content = fs::read_to_string(&gitignore).unwrap_or_default();
+    let lines: Vec<&str> = content.lines().collect();
+
+    // Find block start (either heading)
+    let block_start = lines.iter().position(|l| *l == "# Pemguin TUI" || *l == "# Agent dirs");
+
+    let result = if let Some(start) = block_start {
+        // Find block end: next blank or next # heading after start
+        let block_end = lines[start + 1..]
+            .iter()
+            .position(|l| l.starts_with('#') || l.is_empty())
+            .map(|i| start + 1 + i)
+            .unwrap_or(lines.len());
+
+        let mut block_entries: Vec<String> = lines[start + 1..block_end]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        if add && !block_entries.contains(&entry.to_string()) {
+            block_entries.push(entry.to_string());
+            block_entries.sort();
+        } else if !add {
+            block_entries.retain(|e| e != entry);
+        }
+
+        let before = lines[..start].join("\n");
+        let after = if block_end < lines.len() {
+            lines[block_end..].join("\n")
+        } else {
+            String::new()
+        };
+
+        let mut out = String::new();
+        if !before.is_empty() {
+            out.push_str(&before);
+            out.push('\n');
+        }
+        out.push_str("# Pemguin TUI\n");
+        for e in &block_entries {
+            out.push_str(e);
+            out.push('\n');
+        }
+        if !after.is_empty() {
+            out.push_str(&after);
+            if !after.ends_with('\n') {
+                out.push('\n');
+            }
+        }
+        out
+    } else if add {
+        let mut out = content.trim_end().to_string();
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str("# Pemguin TUI\n");
+        out.push_str(entry);
+        out.push('\n');
+        out
+    } else {
+        return Ok(format!("{entry} was not in gitignore block"));
+    };
+
+    fs::write(&gitignore, result).map_err(|e| e.to_string())?;
+    Ok(if add {
+        format!("Added {entry} to .gitignore")
+    } else {
+        format!("Removed {entry} from .gitignore")
+    })
+}
+
 fn apply_setup_item(
     project_path: &Path,
     item: &SetupItem,
     action: SetupAction,
 ) -> Result<String, String> {
     let project_cfg = load_project_pemguin_config(project_path);
-    if setup_item_disabled(&project_cfg, item.label) {
+    if setup_item_blocked(&project_cfg, item.label) {
         return Ok(format!(
-            "{} disabled by .pemguin.toml — skipped",
+            "{} blocked by .pemguin.toml — skipped",
             item.label
         ));
     }
@@ -857,8 +1094,8 @@ fn apply_setup_item(
 
 fn edit_setup_item(project_path: &Path, item: &SetupItem) -> Result<PathBuf, String> {
     let project_cfg = load_project_pemguin_config(project_path);
-    if setup_item_disabled(&project_cfg, item.label) {
-        return Err(format!("{} disabled by .pemguin.toml", item.label));
+    if setup_item_blocked(&project_cfg, item.label) {
+        return Err(format!("{} blocked by .pemguin.toml", item.label));
     }
     if item.status == SetupStatus::Missing {
         let _ = apply_setup_item(project_path, item, SetupAction::Apply)?;
@@ -972,6 +1209,7 @@ struct App {
     setup_items: Vec<SetupItem>,
     setup_list_state: ListState,
     setup_message: Option<String>,
+    setup_toml_editor: Option<TomlEditorState>,
     // GitHub metadata cache (keyed by "owner/repo")
     meta_cache: HashMap<String, RepoMeta>,
     // Avatar cache (keyed by "owner" -> raw chafa ANSI output)
@@ -2163,6 +2401,7 @@ impl App {
             setup_items: vec![],
             setup_list_state: setup_ls,
             setup_message: None,
+            setup_toml_editor: None,
             meta_cache: load_meta_cache(),
             avatar_cache: HashMap::new(),
             avatar_loading_owner: None,
@@ -2260,6 +2499,7 @@ impl App {
             self.setup_items = vec![];
         }
         self.setup_message = None;
+        self.setup_toml_editor = None;
     }
 
     fn auto_values(&self) -> HashMap<String, String> {
@@ -4225,6 +4465,118 @@ fn handle_memories(app: &mut App, key: KeyCode) -> bool {
 }
 
 fn handle_setup(app: &mut App, key: KeyCode) -> bool {
+    // TomlEditor mode
+    if let Some(ref mut editor) = app.setup_toml_editor {
+        // Text input mode
+        if editor.text_input.is_some() {
+            match key {
+                KeyCode::Esc => {
+                    editor.text_input = None;
+                    editor.text_field = None;
+                }
+                KeyCode::Enter => {
+                    let val = editor.text_input.take().unwrap_or_default();
+                    match editor.text_field.take() {
+                        Some("stack") => {
+                            editor.config.project.stack = if val.is_empty() { None } else { Some(val) };
+                        }
+                        _ => {}
+                    }
+                }
+                KeyCode::Backspace => {
+                    if let Some(ref mut input) = editor.text_input {
+                        input.pop();
+                    }
+                }
+                KeyCode::Char(c) => {
+                    if let Some(ref mut input) = editor.text_input {
+                        input.push(c);
+                    }
+                }
+                _ => {}
+            }
+            return false;
+        }
+
+        let rows = toml_rows(&editor.config);
+        let focusable = focusable_indices(&rows);
+        let n_focusable = focusable.len();
+
+        match key {
+            KeyCode::Esc => {
+                // Save and close
+                let path = editor.project_path.clone();
+                let config = editor.config.clone();
+                match save_pemguin_toml(&path, &config) {
+                    Ok(()) => {
+                        app.setup_toml_editor = None;
+                        app.setup_message = Some("Saved .pemguin.toml".to_string());
+                        app.refresh_setup();
+                    }
+                    Err(e) => {
+                        if let Some(ref mut ed) = app.setup_toml_editor {
+                            ed.message = Some(format!("Error: {e}"));
+                        }
+                    }
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') if n_focusable > 0 => {
+                if let Some(ref mut ed) = app.setup_toml_editor {
+                    ed.cursor = (ed.cursor + 1) % n_focusable;
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') if n_focusable > 0 => {
+                if let Some(ref mut ed) = app.setup_toml_editor {
+                    let cur = ed.cursor;
+                    ed.cursor = if cur == 0 { n_focusable - 1 } else { cur - 1 };
+                }
+            }
+            KeyCode::Char(' ') | KeyCode::Enter => {
+                if let Some(ref mut ed) = app.setup_toml_editor {
+                    let row_idx = focusable[ed.cursor];
+                    let rows = toml_rows(&ed.config);
+                    match &rows[row_idx] {
+                        TomlRow::Checkbox { section, field, label, checked } => {
+                            let label = label.to_string();
+                            let checked = *checked;
+                            match (*section, *field) {
+                                ("project", "agents") => {
+                                    if checked {
+                                        ed.config.project.agents.retain(|a| a != &label);
+                                    } else {
+                                        ed.config.project.agents.push(label);
+                                    }
+                                }
+                                ("setup", "skip") => {
+                                    if checked {
+                                        ed.config.setup.skip.retain(|s| s != &label);
+                                    } else {
+                                        ed.config.setup.skip.push(label);
+                                    }
+                                }
+                                ("setup", "block") => {
+                                    if checked {
+                                        ed.config.setup.block.retain(|s| s != &label);
+                                    } else {
+                                        ed.config.setup.block.push(label);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        TomlRow::TextField { field, value, .. } => {
+                            ed.text_input = Some(value.clone());
+                            ed.text_field = Some(field);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+        return false;
+    }
+
     match key {
         KeyCode::Down | KeyCode::Char('j') if !app.setup_items.is_empty() => {
             let n = (app.setup_list_state.selected().unwrap_or(0) + 1) % app.setup_items.len();
@@ -4317,6 +4669,45 @@ fn handle_setup(app: &mut App, key: KeyCode) -> bool {
         KeyCode::Char('r') => {
             app.refresh_setup();
         }
+        KeyCode::Char('g') => {
+            if let Some(sel) = app.setup_list_state.selected() {
+                if let Some(idx) = app.active_project_idx {
+                    if let Some(p) = app.projects.get(idx) {
+                        let path = p.path.clone();
+                        let item = app.setup_items[sel].clone();
+                        if let Some(gip) = item.gitignore_path {
+                            let add = !item.gitignored;
+                            app.setup_message = Some(
+                                toggle_gitignore_entry(&path, gip, add)
+                                    .unwrap_or_else(|e| format!("Error: {e}")),
+                            );
+                            app.refresh_setup();
+                        } else {
+                            app.setup_message = Some(format!("{} is not gitignore-toggleable", item.label));
+                        }
+                    }
+                }
+            }
+        }
+        KeyCode::Char('f') => {
+            if let Some(sel) = app.setup_list_state.selected() {
+                if let Some(idx) = app.active_project_idx {
+                    if let Some(p) = app.projects.get(idx) {
+                        if app.setup_items[sel].label == ".pemguin.toml" {
+                            let config = load_project_pemguin_config(&p.path);
+                            app.setup_toml_editor = Some(TomlEditorState {
+                                project_path: p.path.clone(),
+                                config,
+                                cursor: 0,
+                                text_input: None,
+                                text_field: None,
+                                message: None,
+                            });
+                        }
+                    }
+                }
+            }
+        }
         _ => {}
     }
     false
@@ -4363,6 +4754,80 @@ fn draw_setup(frame: &mut Frame, app: &App) {
             .block(Block::default().borders(Borders::ALL).title(" config ")),
             outer[2],
         );
+    } else if let Some(editor) = &app.setup_toml_editor {
+        // Render TomlEditor
+        let rows = toml_rows(&editor.config);
+        let focusable = focusable_indices(&rows);
+        let focused_row_idx = focusable.get(editor.cursor).copied();
+
+        // Input bar height
+        let input_h = if editor.text_input.is_some() || editor.message.is_some() { 3u16 } else { 0 };
+        let inner = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(0), Constraint::Length(input_h)])
+            .split(outer[2]);
+
+        let items: Vec<ListItem> = rows.iter().enumerate().map(|(i, row)| {
+            let is_focused = Some(i) == focused_row_idx;
+            match row {
+                TomlRow::Section(label) => ListItem::new(Line::from(vec![
+                    Span::styled(format!("  {label}"), Style::default().fg(FG_DIM).add_modifier(Modifier::BOLD)),
+                ])),
+                TomlRow::TextField { label, value, .. } => {
+                    let display_val = if editor.text_input.is_some() && is_focused {
+                        format!("{}_", editor.text_input.as_deref().unwrap_or(""))
+                    } else if value.is_empty() {
+                        "—".to_string()
+                    } else {
+                        value.clone()
+                    };
+                    ListItem::new(Line::from(vec![
+                        Span::raw("    "),
+                        Span::styled(format!("{label:<16}"), Style::default()),
+                        Span::styled(display_val, Style::default().fg(C_GREEN)),
+                    ]))
+                }
+                TomlRow::Checkbox { label, checked, .. } => {
+                    let box_icon = if *checked { "■" } else { "□" };
+                    let box_style = if *checked {
+                        Style::default().fg(C_GREEN)
+                    } else {
+                        Style::default().fg(FG_DIM)
+                    };
+                    ListItem::new(Line::from(vec![
+                        Span::raw("    "),
+                        Span::styled(format!("{box_icon} "), box_style),
+                        Span::styled(label.to_string(), Style::default()),
+                    ]))
+                }
+            }
+        }).collect();
+
+        let mut ls = ListState::default();
+        ls.select(focused_row_idx);
+        frame.render_stateful_widget(
+            List::new(items)
+                .block(Block::default().borders(Borders::ALL).title(" .pemguin.toml "))
+                .highlight_style(hl())
+                .highlight_symbol("> "),
+            inner[0],
+            &mut ls,
+        );
+
+        if input_h > 0 {
+            let content = if let Some(input) = &editor.text_input {
+                Span::styled(format!("  stack: {input}_"), Style::default().fg(C_GREEN))
+            } else if let Some(msg) = &editor.message {
+                let color = if msg.starts_with("Error:") { C_RED } else { C_GREEN };
+                Span::styled(format!("  {msg}"), Style::default().fg(color))
+            } else {
+                Span::raw("")
+            };
+            frame.render_widget(
+                Paragraph::new(content).block(Block::default().borders(Borders::ALL)),
+                inner[1],
+            );
+        }
     } else {
         let inner = Layout::default()
             .direction(Direction::Vertical)
@@ -4381,16 +4846,19 @@ fn draw_setup(frame: &mut Frame, app: &App) {
                     SetupStatus::Missing => (I_CROSS, Style::default().fg(C_RED)),
                     SetupStatus::Stale => (I_WARN, Style::default().fg(C_YELLOW)),
                 };
-                let action_hint = match item.status {
-                    SetupStatus::Ok => "  enter safe apply  e edit  d delete  R reset",
-                    SetupStatus::Missing => "  enter safe apply  e create+edit  R reset",
-                    SetupStatus::Stale => "  d delete  e edit  R reset",
-                };
                 ListItem::new(Line::from(vec![
                     Span::styled(format!(" {icon}  "), icon_style),
-                    Span::styled(format!("{:<30}", item.label), Style::default()),
+                    Span::styled(format!("{:<26}", item.label), Style::default()),
+                    if item.gitignore_path.is_some() {
+                        if item.gitignored {
+                            Span::styled(" ↓ ", Style::default().fg(C_GREEN).add_modifier(Modifier::DIM))
+                        } else {
+                            Span::styled(" ○ ", Style::default().fg(FG_XDIM))
+                        }
+                    } else {
+                        Span::raw("   ")
+                    },
                     Span::styled(item.detail, Style::default().fg(FG_DIM)),
-                    Span::styled(action_hint, Style::default().fg(FG_XDIM)),
                 ]))
             })
             .collect();
@@ -4429,21 +4897,32 @@ fn draw_setup(frame: &mut Frame, app: &App) {
         }
     }
 
-    frame.render_widget(
-        Paragraph::new(footer(&[
-            ("↑↓/jk", "navigate"),
-            ("enter", "safe apply"),
-            ("e", "edit"),
-            ("d", "delete"),
-            ("R", "reset default"),
-            ("a", "apply all"),
-            ("r", "rescan"),
-            ("esc", "back"),
-            ("tab", "switch"),
-            ("q", "quit"),
-        ])),
-        outer[3],
-    );
+    if app.setup_toml_editor.is_some() {
+        frame.render_widget(
+            Paragraph::new(footer(&[
+                ("↑↓/jk", "navigate"),
+                ("space/enter", "toggle / edit"),
+                ("esc", "save + close"),
+            ])),
+            outer[3],
+        );
+    } else {
+        frame.render_widget(
+            Paragraph::new(footer(&[
+                ("↑↓/jk", "navigate"),
+                ("enter", "safe apply"),
+                ("e", "edit"),
+                ("g", "gitignore"),
+                ("f", "fields (.toml)"),
+                ("d", "delete"),
+                ("R", "reset"),
+                ("a", "apply all"),
+                ("r", "rescan"),
+                ("esc", "back"),
+            ])),
+            outer[3],
+        );
+    }
 }
 
 fn draw_memories(frame: &mut Frame, app: &App) {
