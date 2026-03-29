@@ -90,6 +90,25 @@ Feature source of truth. Update this when features ship, change, or get cut.
 - ✅ Show server name, command, args
 - 📋 Add / edit / remove MCP server from within pm
 
+## Sessions Tab (tab 9)
+
+- ✅ List agent sessions per project (Claude Code, Codex, Gemini placeholder)
+- ✅ Show agent type, start date, first user message, pending/resolved status
+- ✅ Export indicator (`↓`) and pending indicator (`·`) in list
+- ✅ New session picker — select agent + prompt, copy launch command to clipboard
+- ✅ Resume session — copy resume command to clipboard with `y` (when ID resolved)
+- ✅ Inline session summary view with `s` (full turn-by-turn JSONL render)
+- ✅ Export session to `.pemguin/exports/` in markdown and plain text with `e`
+- ✅ Delete session entry with `d`
+- ✅ Import Claude sessions from `~/.claude/projects/` (both v1 `_`-preserving and v2 `_`→`-` encodings)
+- ✅ Import Codex sessions from `~/.codex/sessions/YYYY/MM/DD/` matching `cwd`
+- ✅ Session IDs are nullable — present when resolved, absent when pending (portable across machines)
+- ✅ Persist session registry to `.pemguin/sessions.toml`
+- 📋 Cache Codex session scan results — currently does a full walk of `~/.codex/sessions/YYYY/MM/DD/` on every Sessions tab open; for large Codex histories this can be slow. Future: persist last-scanned state and do incremental updates.
+- 📋 Gemini session import
+- 📋 Show session token count / cost estimate
+- 📋 Filter sessions by agent type
+
 ## Pane Tab (tab 8)
 
 - ✅ Launch `lazygit`, `yazi`, and `$EDITOR` in the project root
@@ -100,7 +119,7 @@ Feature source of truth. Update this when features ship, change, or get cut.
 
 ## Navigation & UX
 
-- ✅ Number keys 1–8 to switch tabs
+- ✅ Number keys 1–9 to switch tabs
 - ✅ Tab key cycles through tabs
 - ✅ Esc = back (InProject → Projects)
 - ✅ Split header: identity row (badge + project + branch) + nav row (tabs)
