@@ -215,11 +215,18 @@ struct TextEditorState {
     status: Option<String>,
 }
 
+struct RecentCommit {
+    hash: String,
+    date_label: String,
+    time_label: String,
+    subject: String,
+}
+
 struct HomeData {
     gh_description: Option<String>, // GitHub repo description
     homepage: Option<String>,       // GitHub homepage URL (custom)
     url: String,                    // https://github.com/owner/repo
-    recent_commits: Vec<String>,    // git log --oneline -6
+    recent_commits: Vec<RecentCommit>,
     setup_ok: usize,
     setup_total: usize,
     stack: Option<String>, // detected stack label
@@ -252,6 +259,37 @@ fn detect_stack(path: &Path) -> Option<String> {
         return Some("Go".to_string());
     }
     None
+}
+
+fn load_recent_commits(path: &Path) -> Vec<RecentCommit> {
+    git_in(
+        path,
+        &[
+            "log",
+            "--date=format:%A, %B %-d %Y",
+            "--pretty=format:%h%x09%ad%x09%aI%x09%s",
+            "-6",
+        ],
+    )
+    .unwrap_or_default()
+    .lines()
+    .filter_map(|line| {
+        let mut parts = line.splitn(4, '\t');
+        let hash = parts.next()?.to_string();
+        let date_label = parts.next()?.to_string();
+        let timestamp = parts.next()?;
+        let subject = parts.next()?.to_string();
+        let (_, rest) = timestamp.split_once('T')?;
+        let time_part = rest.get(0..5)?;
+        let time_label = time_part.get(0..5)?.to_string();
+        Some(RecentCommit {
+            hash,
+            date_label,
+            time_label,
+            subject,
+        })
+    })
+    .collect()
 }
 
 fn load_home_data(path: &Path, repo: &str) -> HomeData {
@@ -289,11 +327,7 @@ fn load_home_data(path: &Path, repo: &str) -> HomeData {
     };
 
     // Recent commits
-    let recent_commits = git_in(path, &["log", "--oneline", "-6"])
-        .unwrap_or_default()
-        .lines()
-        .map(|l| l.to_string())
-        .collect();
+    let recent_commits = load_recent_commits(path);
 
     // Setup health
     let items = scan_setup(path);
@@ -320,11 +354,7 @@ fn load_home_data_local(path: &Path, repo: &str) -> HomeData {
         String::new()
     };
 
-    let recent_commits = git_in(path, &["log", "--oneline", "-6"])
-        .unwrap_or_default()
-        .lines()
-        .map(|l| l.to_string())
-        .collect();
+    let recent_commits = load_recent_commits(path);
 
     let items = scan_setup(path);
     let setup_total = items.len();
@@ -3325,14 +3355,28 @@ fn draw_home(frame: &mut Frame, app: &App) {
                 Style::default().fg(Color::DarkGray),
             )));
         } else {
+            let mut current_day: Option<&str> = None;
             for commit in &data.recent_commits {
-                let (hash, rest) = commit.split_once(' ').unwrap_or(("", commit));
+                if current_day != Some(commit.date_label.as_str()) {
+                    if current_day.is_some() {
+                        right.push(Line::from(""));
+                    }
+                    right.push(Line::from(Span::styled(
+                        format!("  {}", commit.date_label),
+                        Style::default().fg(C_PURPLE).add_modifier(Modifier::BOLD),
+                    )));
+                    current_day = Some(commit.date_label.as_str());
+                }
                 right.push(Line::from(vec![
                     Span::styled(
-                        format!("  {I_COMMIT} {hash}  "),
+                        format!("    {}  ", commit.time_label),
+                        Style::default().fg(FG_XDIM),
+                    ),
+                    Span::styled(
+                        format!("{I_COMMIT} {}  ", commit.hash),
                         Style::default().fg(FG_DIM),
                     ),
-                    Span::raw(rest.to_string()),
+                    Span::raw(commit.subject.clone()),
                 ]));
             }
         }
