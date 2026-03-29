@@ -234,6 +234,7 @@ struct AgentSession {
 enum SessionsState {
     List,
     NewPicker { agent_idx: usize, prompt_idx: Option<usize> },
+    Summary { lines: Vec<String>, scroll: usize },
 }
 
 #[derive(PartialEq, Clone)]
@@ -5151,6 +5152,135 @@ fn read_first_user_message(path: &Path) -> Option<String> {
     None
 }
 
+struct SessionTurn {
+    role: String,   // "user" or "assistant"
+    text: String,
+}
+
+fn parse_session_turns(path: &Path) -> Vec<SessionTurn> {
+    let content = match fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return vec![],
+    };
+    let mut turns: Vec<SessionTurn> = vec![];
+    for line in content.lines() {
+        let v: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        match v.get("type").and_then(|t| t.as_str()) {
+            Some("user") => {
+                if let Some(text) = v
+                    .get("message")
+                    .and_then(|m| m.get("content"))
+                    .and_then(|c| c.as_str())
+                {
+                    let text = text.trim().to_string();
+                    if !text.is_empty() {
+                        turns.push(SessionTurn { role: "user".into(), text });
+                    }
+                }
+            }
+            Some("assistant") => {
+                if let Some(content_arr) = v
+                    .get("message")
+                    .and_then(|m| m.get("content"))
+                    .and_then(|c| c.as_array())
+                {
+                    let text: String = content_arr
+                        .iter()
+                        .filter_map(|block| {
+                            if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+                                block.get("text").and_then(|t| t.as_str()).map(|s| s.trim().to_string())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if !text.is_empty() {
+                        turns.push(SessionTurn { role: "assistant".into(), text });
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    turns
+}
+
+fn session_summary(turns: &[SessionTurn]) -> Vec<String> {
+    // User messages only, as bullet points — what was asked/directed
+    turns
+        .iter()
+        .filter(|t| t.role == "user")
+        .map(|t| {
+            let line: String = t.text.lines().next().unwrap_or("").chars().take(100).collect();
+            format!("• {}", line)
+        })
+        .collect()
+}
+
+fn export_session_markdown(turns: &[SessionTurn], session: &AgentSession) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("# Session — {}\n\n", format_session_date(&session.started_at)));
+    out.push_str(&format!("**Agent:** {}  \n", session.agent.label()));
+    if let Some(id) = &session.id {
+        out.push_str(&format!("**ID:** {}  \n", id));
+    }
+    if let Some(p) = &session.prompt {
+        out.push_str(&format!("**Prompt:** {}  \n", p));
+    }
+    out.push_str("\n---\n\n");
+    for turn in turns {
+        if turn.role == "user" {
+            out.push_str(&format!("**User:** {}\n\n", turn.text));
+        } else {
+            out.push_str(&format!("{}\n\n", turn.text));
+            out.push_str("---\n\n");
+        }
+    }
+    out
+}
+
+fn export_session_text(turns: &[SessionTurn], session: &AgentSession) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("Session: {}\n", format_session_date(&session.started_at)));
+    out.push_str(&format!("Agent: {}\n", session.agent.label()));
+    if let Some(id) = &session.id {
+        out.push_str(&format!("ID: {}\n", id));
+    }
+    out.push_str("\n");
+    for turn in turns {
+        let role = if turn.role == "user" { "You" } else { "Agent" };
+        out.push_str(&format!("[{}]\n{}\n\n", role, turn.text));
+    }
+    out
+}
+
+fn write_export(project_path: &Path, session: &AgentSession, content: &str, ext: &str) -> Option<PathBuf> {
+    let dir = project_path.join(".pemguin").join("exports");
+    fs::create_dir_all(&dir).ok()?;
+    let id_part = session.id.as_deref().unwrap_or("unknown");
+    let short_id = &id_part[..id_part.len().min(8)];
+    let date = session.started_at.chars().take(10).collect::<String>();
+    let filename = format!("{}-{}.{}", date, short_id, ext);
+    let path = dir.join(&filename);
+    fs::write(&path, content).ok()?;
+    Some(path)
+}
+
+fn jsonl_path_for_session(session: &AgentSession, project_path: &Path) -> Option<PathBuf> {
+    let id = session.id.as_ref()?;
+    for dir in claude_project_dirs(project_path) {
+        let p = dir.join(format!("{}.jsonl", id));
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    None
+}
+
 fn unix_to_iso(secs: u64) -> String {
     let min = secs / 60;
     let hour = min / 60;
@@ -5314,6 +5444,78 @@ fn handle_sessions(app: &mut App, key: KeyCode) -> bool {
                         app.sessions_message = Some("session removed".to_string());
                     }
                 }
+                KeyCode::Char('s') => {
+                    // Inline summary view
+                    let Some(i) = app.sessions_list_state.selected() else { return false; };
+                    let Some(session) = app.sessions.get(i) else { return false; };
+                    let Some(proj_idx) = app.active_project_idx else { return false; };
+                    let Some(project) = app.projects.get(proj_idx) else { return false; };
+                    if let Some(jsonl) = jsonl_path_for_session(session, &project.path) {
+                        let turns = parse_session_turns(&jsonl);
+                        let lines = session_summary(&turns);
+                        if lines.is_empty() {
+                            app.sessions_message = Some("no user messages found".to_string());
+                        } else {
+                            app.sessions_state = SessionsState::Summary { lines, scroll: 0 };
+                        }
+                    } else {
+                        app.sessions_message = Some("session file not found locally".to_string());
+                    }
+                }
+                KeyCode::Char('e') => {
+                    // Export submenu: markdown + text
+                    let Some(i) = app.sessions_list_state.selected() else { return false; };
+                    let Some(session) = app.sessions.get(i).cloned() else { return false; };
+                    let Some(proj_idx) = app.active_project_idx else { return false; };
+                    let Some(project) = app.projects.get(proj_idx) else { return false; };
+                    let path = project.path.clone();
+                    if let Some(jsonl) = jsonl_path_for_session(&session, &path) {
+                        let turns = parse_session_turns(&jsonl);
+                        let md = export_session_markdown(&turns, &session);
+                        let txt = export_session_text(&turns, &session);
+                        let summary_lines: Vec<String> = std::iter::once(format!(
+                            "## Summary — {}  ({})",
+                            format_session_date(&session.started_at),
+                            session.agent.label()
+                        ))
+                        .chain(std::iter::once(String::new()))
+                        .chain(session_summary(&turns))
+                        .collect();
+                        let md_path = write_export(&path, &session, &md, "md");
+                        let txt_path = write_export(&path, &session, &txt, "txt");
+                        let msg = match (md_path, txt_path) {
+                            (Some(m), Some(t)) => format!(
+                                "exported → {} and {}",
+                                m.file_name().unwrap_or_default().to_string_lossy(),
+                                t.file_name().unwrap_or_default().to_string_lossy()
+                            ),
+                            _ => "export failed".to_string(),
+                        };
+                        app.sessions_state = SessionsState::Summary { lines: summary_lines, scroll: 0 };
+                        app.sessions_message = Some(msg);
+                    } else {
+                        app.sessions_message = Some("session file not found locally".to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+        SessionsState::Summary { lines, scroll } => {
+            let lines = lines.clone();
+            let scroll = *scroll;
+            match key {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    app.sessions_state = SessionsState::List;
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    let max = lines.len().saturating_sub(1);
+                    let new_scroll = (scroll + 1).min(max);
+                    app.sessions_state = SessionsState::Summary { lines, scroll: new_scroll };
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    let new_scroll = scroll.saturating_sub(1);
+                    app.sessions_state = SessionsState::Summary { lines, scroll: new_scroll };
+                }
                 _ => {}
             }
         }
@@ -5338,6 +5540,45 @@ fn draw_sessions(frame: &mut Frame, app: &App) {
     frame.render_widget(Paragraph::new(header_row(app)), outer[0]);
     frame.render_widget(Paragraph::new(nav_row(app)), outer[1]);
 
+    // Summary view
+    if let SessionsState::Summary { lines, scroll } = &app.sessions_state {
+        let visible: Vec<Line> = lines
+            .iter()
+            .skip(*scroll)
+            .map(|l| {
+                if l.starts_with("## ") {
+                    Line::from(Span::styled(
+                        l.trim_start_matches("## ").to_string(),
+                        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                    ))
+                } else if l.starts_with("• ") {
+                    Line::from(vec![
+                        Span::styled("• ", Style::default().fg(FG_DIM)),
+                        Span::raw(l.trim_start_matches("• ").to_string()),
+                    ])
+                } else {
+                    Line::from(l.as_str().to_string())
+                }
+            })
+            .collect();
+        frame.render_widget(
+            Paragraph::new(visible)
+                .block(Block::default().borders(Borders::ALL).title(" summary "))
+                .wrap(Wrap { trim: false }),
+            outer[2],
+        );
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("j/k", Style::default().fg(ACCENT)),
+                Span::raw(" scroll  "),
+                Span::styled("esc", Style::default().fg(FG_DIM)),
+                Span::raw(" back"),
+            ])),
+            outer[3],
+        );
+        return;
+    }
+
     // Footer
     let footer = if let SessionsState::NewPicker { .. } = &app.sessions_state {
         Line::from(vec![
@@ -5351,10 +5592,9 @@ fn draw_sessions(frame: &mut Frame, app: &App) {
             Span::raw(" cancel"),
         ])
     } else {
-        let has_id = app.sessions_list_state.selected()
-            .and_then(|i| app.sessions.get(i))
-            .and_then(|s| s.id.as_ref())
-            .is_some();
+        let selected_session = app.sessions_list_state.selected()
+            .and_then(|i| app.sessions.get(i));
+        let has_id = selected_session.and_then(|s| s.id.as_ref()).is_some();
         let mut spans = vec![
             Span::styled("n", Style::default().fg(ACCENT)),
             Span::raw(" new  "),
@@ -5362,12 +5602,16 @@ fn draw_sessions(frame: &mut Frame, app: &App) {
         if has_id {
             spans.extend([
                 Span::styled("y", Style::default().fg(ACCENT)),
-                Span::raw(" copy resume  "),
+                Span::raw(" resume  "),
+                Span::styled("s", Style::default().fg(ACCENT)),
+                Span::raw(" summary  "),
+                Span::styled("e", Style::default().fg(ACCENT)),
+                Span::raw(" export  "),
             ]);
         }
         if !app.sessions.is_empty() {
             spans.extend([
-                Span::styled("d", Style::default().fg(ACCENT)),
+                Span::styled("d", Style::default().fg(FG_DIM)),
                 Span::raw(" delete"),
             ]);
         }
