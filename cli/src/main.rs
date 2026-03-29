@@ -5112,8 +5112,117 @@ fn resolve_sessions(sessions: &mut Vec<AgentSession>, project_path: &Path) {
         });
     }
 
+    // Import Codex sessions for this project
+    import_codex_sessions(sessions, project_path);
+
     // Re-sort most recent first
     sessions.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+}
+
+fn import_codex_sessions(sessions: &mut Vec<AgentSession>, project_path: &Path) {
+    let sessions_dir = match dirs_home() {
+        Some(h) => h.join(".codex").join("sessions"),
+        None => return,
+    };
+    if !sessions_dir.exists() {
+        return;
+    }
+
+    let known_ids: std::collections::HashSet<String> = sessions
+        .iter()
+        .filter_map(|s| s.id.clone())
+        .collect();
+
+    let project_str = project_path.to_string_lossy().to_string();
+
+    // Walk YYYY/MM/DD dirs
+    let year_dirs: Vec<PathBuf> = fs::read_dir(&sessions_dir)
+        .into_iter().flatten().filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .map(|e| e.path()).collect();
+
+    for year_dir in year_dirs {
+        let month_dirs: Vec<PathBuf> = fs::read_dir(&year_dir)
+            .into_iter().flatten().filter_map(|e| e.ok())
+            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .map(|e| e.path()).collect();
+        for month_dir in month_dirs {
+            let day_dirs: Vec<PathBuf> = fs::read_dir(&month_dir)
+                .into_iter().flatten().filter_map(|e| e.ok())
+                .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+                .map(|e| e.path()).collect();
+            for day_dir in day_dirs {
+                let jsonl_files: Vec<PathBuf> = fs::read_dir(&day_dir)
+                    .into_iter().flatten().filter_map(|e| e.ok())
+                    .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("jsonl"))
+                    .map(|e| e.path()).collect();
+                for jsonl in jsonl_files {
+                    if let Some(session) = parse_codex_session(&jsonl, &project_str, &known_ids) {
+                        sessions.push(session);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn parse_codex_session(
+    path: &Path,
+    project_path: &str,
+    known_ids: &std::collections::HashSet<String>,
+) -> Option<AgentSession> {
+    let content = fs::read_to_string(path).ok()?;
+    let mut lines = content.lines();
+
+    // First line must be session_meta
+    let meta: serde_json::Value = serde_json::from_str(lines.next()?).ok()?;
+    if meta.get("type").and_then(|t| t.as_str()) != Some("session_meta") {
+        return None;
+    }
+    let payload = meta.get("payload")?;
+    let cwd = payload.get("cwd").and_then(|v| v.as_str())?;
+    if cwd != project_path {
+        return None;
+    }
+    let id = payload.get("id").and_then(|v| v.as_str())?.to_string();
+    if known_ids.contains(&id) {
+        return None;
+    }
+    let started_at = payload
+        .get("timestamp")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    // Find first real user message
+    let first_message = content.lines().find_map(|line| {
+        let v: serde_json::Value = serde_json::from_str(line).ok()?;
+        if v.get("type").and_then(|t| t.as_str()) != Some("response_item") {
+            return None;
+        }
+        let p = v.get("payload")?;
+        if p.get("type").and_then(|t| t.as_str()) != Some("message") {
+            return None;
+        }
+        if p.get("role").and_then(|r| r.as_str()) != Some("user") {
+            return None;
+        }
+        for block in p.get("content")?.as_array()? {
+            let text = block.get("text").and_then(|t| t.as_str()).unwrap_or("");
+            if !text.is_empty() && !text.starts_with("<environment_context>") {
+                return Some(text.chars().take(80).collect());
+            }
+        }
+        None
+    });
+
+    Some(AgentSession {
+        id: Some(id),
+        agent: AgentKind::Codex,
+        started_at,
+        prompt: None,
+        first_message,
+    })
 }
 
 // Parse ISO 8601 timestamp to unix seconds (simplified, no external crate)
