@@ -5002,29 +5002,32 @@ fn save_sessions(project_path: &Path, sessions: &[AgentSession]) {
 // Attempt to resolve pending sessions by scanning agent storage.
 // For Claude Code: ~/.claude/projects/{encoded-path}/{uuid}.jsonl
 // Match unresolved sessions by finding JSONL files created within 120s of started_at.
-fn resolve_sessions(sessions: &mut Vec<AgentSession>, project_path: &Path) {
-    let unresolved: Vec<usize> = sessions
-        .iter()
-        .enumerate()
-        .filter(|(_, s)| s.id.is_none() && s.agent == AgentKind::Claude)
-        .map(|(i, _)| i)
-        .collect();
-    if unresolved.is_empty() {
-        return;
+// Find Claude project storage dirs for a given project path.
+// Claude Code has used two encoding schemes over time:
+//   v1: replace '/' with '-'  (underscores preserved)
+//   v2: replace '/' and '_' with '-'
+// We check both and return all that exist.
+fn claude_project_dirs(project_path: &Path) -> Vec<PathBuf> {
+    let home = match dirs_home() {
+        Some(h) => h,
+        None => return vec![],
+    };
+    let base = home.join(".claude").join("projects");
+    let path_str = project_path.to_string_lossy();
+    let encoded_v1 = path_str.replace('/', "-");
+    let encoded_v2 = path_str.replace('/', "-").replace('_', "-");
+    let mut dirs = vec![];
+    for encoded in [encoded_v1, encoded_v2] {
+        let dir = base.join(&encoded);
+        if dir.exists() && !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
     }
+    dirs
+}
 
-    // Encode project path the same way Claude Code does:
-    // absolute path with '/' replaced by '-'
-    let encoded = project_path
-        .to_string_lossy()
-        .replace('/', "-");
-    let claude_dir = dirs_home()
-        .map(|h| h.join(".claude").join("projects").join(&encoded))
-        .filter(|p| p.exists());
-
-    let Some(claude_dir) = claude_dir else { return };
-
-    let jsonl_files: Vec<(String, std::time::SystemTime)> = fs::read_dir(&claude_dir)
+fn jsonl_files_in(dir: &Path) -> Vec<(String, std::time::SystemTime)> {
+    fs::read_dir(dir)
         .into_iter()
         .flatten()
         .filter_map(|e| e.ok())
@@ -5040,32 +5043,73 @@ fn resolve_sessions(sessions: &mut Vec<AgentSession>, project_path: &Path) {
             let stem = e.path().file_stem()?.to_str()?.to_string();
             Some((stem, mtime))
         })
+        .collect()
+}
+
+// Resolve pending sessions AND import any existing Claude sessions not yet recorded.
+fn resolve_sessions(sessions: &mut Vec<AgentSession>, project_path: &Path) {
+    let claude_dirs = claude_project_dirs(project_path);
+    if claude_dirs.is_empty() {
+        return;
+    }
+
+    // Collect all JSONL files across all matching dirs
+    let all_jsonl: Vec<(PathBuf, String, std::time::SystemTime)> = claude_dirs
+        .iter()
+        .flat_map(|dir| {
+            jsonl_files_in(dir)
+                .into_iter()
+                .map(|(stem, mtime)| (dir.join(format!("{}.jsonl", stem)), stem, mtime))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    // Resolve pending entries by timestamp proximity
+    let unresolved: Vec<usize> = sessions
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.id.is_none() && s.agent == AgentKind::Claude)
+        .map(|(i, _)| i)
         .collect();
 
     for idx in unresolved {
-        let session = &sessions[idx];
-        // Parse started_at as a rough timestamp for comparison
-        let Ok(session_time) = chrono_parse(&session.started_at) else {
-            continue;
-        };
-        // Find a JSONL file whose mtime is within 120s of started_at
-        if let Some((uuid, _)) = jsonl_files.iter().find(|(_, mtime)| {
-            let secs = mtime
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            let diff = (secs as i64 - session_time as i64).abs();
-            diff < 120
+        let Ok(session_time) = chrono_parse(&sessions[idx].started_at) else { continue };
+        if let Some((jsonl_path, uuid, _)) = all_jsonl.iter().find(|(_, _, mtime)| {
+            let secs = mtime.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+            (secs as i64 - session_time as i64).abs() < 120
         }) {
-            // Try to read first user message
-            let jsonl_path = claude_dir.join(format!("{}.jsonl", uuid));
-            let first_msg = read_first_user_message(&jsonl_path);
+            let first_msg = read_first_user_message(jsonl_path);
             sessions[idx].id = Some(uuid.clone());
             if sessions[idx].first_message.is_none() {
                 sessions[idx].first_message = first_msg;
             }
         }
     }
+
+    // Import sessions from Claude storage that aren't recorded yet
+    let known_ids: std::collections::HashSet<String> = sessions
+        .iter()
+        .filter_map(|s| s.id.clone())
+        .collect();
+
+    for (jsonl_path, uuid, mtime) in &all_jsonl {
+        if known_ids.contains(uuid) {
+            continue;
+        }
+        let secs = mtime.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let started_at = unix_to_iso(secs);
+        let first_message = read_first_user_message(jsonl_path);
+        sessions.push(AgentSession {
+            id: Some(uuid.clone()),
+            agent: AgentKind::Claude,
+            started_at,
+            prompt: None,
+            first_message,
+        });
+    }
+
+    // Re-sort most recent first
+    sessions.sort_by(|a, b| b.started_at.cmp(&a.started_at));
 }
 
 // Parse ISO 8601 timestamp to unix seconds (simplified, no external crate)
@@ -5107,22 +5151,13 @@ fn read_first_user_message(path: &Path) -> Option<String> {
     None
 }
 
-fn now_iso() -> String {
-    // Use file mtime of a temp write as a proxy since we have no chrono dep
-    // Fall back to a static format using std::time
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    // Convert unix seconds to rough ISO 8601 (good enough for sorting/display)
-    let s = secs;
-    let min = s / 60;
+fn unix_to_iso(secs: u64) -> String {
+    let min = secs / 60;
     let hour = min / 60;
     let day_total = hour / 24;
-    let sec = s % 60;
+    let sec = secs % 60;
     let min = min % 60;
     let hour = hour % 24;
-    // Compute year/month/day from day_total (rough, ignores leap years perfectly)
     let mut year = 1970u64;
     let mut days = day_total;
     loop {
@@ -5139,6 +5174,14 @@ fn now_iso() -> String {
         month += 1;
     }
     format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", year, month + 1, days + 1, hour, min, sec)
+}
+
+fn now_iso() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    unix_to_iso(secs)
 }
 
 fn format_session_date(iso: &str) -> String {
