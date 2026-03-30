@@ -331,6 +331,12 @@ struct HomeData {
     setup_ok: usize,
     setup_total: usize,
     stack: Option<String>, // detected stack label
+    stars: Option<u32>,
+    forks: Option<u32>,
+    license: Option<String>,
+    open_prs: Option<u32>,
+    readme: Option<String>,
+    dirty_files: Vec<String>,
 }
 
 fn detect_stack(path: &Path) -> Option<String> {
@@ -393,10 +399,25 @@ fn load_recent_commits(path: &Path) -> Vec<RecentCommit> {
     .collect()
 }
 
+fn load_readme(path: &Path) -> Option<String> {
+    ["README.md", "readme.md", "Readme.md", "README"]
+        .iter()
+        .find_map(|name| fs::read_to_string(path.join(name)).ok())
+}
+
+fn load_dirty_files(path: &Path) -> Vec<String> {
+    git_in(path, &["status", "--short"])
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| l.to_string())
+        .collect()
+}
+
 fn load_home_data(path: &Path, repo: &str) -> HomeData {
-    let (gh_description, homepage) = if !repo.is_empty() {
+    let (gh_description, homepage, stars, forks, license, open_prs) = if !repo.is_empty() {
         let out = Command::new("gh")
-            .args(["repo", "view", repo, "--json", "description,homepageUrl"])
+            .args(["repo", "view", repo, "--json", "description,homepageUrl,stargazerCount,forkCount,licenseInfo,pullRequests"])
             .output()
             .ok()
             .filter(|o| o.status.success());
@@ -410,15 +431,22 @@ fn load_home_data(path: &Path, repo: &str) -> HomeData {
                     .as_str()
                     .filter(|s| !s.is_empty())
                     .map(|s| s.to_string());
-                (desc, home)
+                let stars = v["stargazerCount"].as_u64().map(|n| n as u32);
+                let forks = v["forkCount"].as_u64().map(|n| n as u32);
+                let license = v["licenseInfo"]["spdxId"]
+                    .as_str()
+                    .filter(|s| !s.is_empty() && *s != "NOASSERTION")
+                    .map(|s| s.to_string());
+                let open_prs = v["pullRequests"]["totalCount"].as_u64().map(|n| n as u32);
+                (desc, home, stars, forks, license, open_prs)
             } else {
-                (None, None)
+                (None, None, None, None, None, None)
             }
         } else {
-            (None, None)
+            (None, None, None, None, None, None)
         }
     } else {
-        (None, None)
+        (None, None, None, None, None, None)
     };
 
     let url = if repo.contains('/') {
@@ -436,6 +464,8 @@ fn load_home_data(path: &Path, repo: &str) -> HomeData {
     let setup_ok = items.iter().filter(|i| i.status == SetupStatus::Ok).count();
 
     let stack = detect_stack(path);
+    let readme = load_readme(path);
+    let dirty_files = load_dirty_files(path);
 
     HomeData {
         gh_description,
@@ -445,6 +475,12 @@ fn load_home_data(path: &Path, repo: &str) -> HomeData {
         setup_ok,
         setup_total,
         stack,
+        stars,
+        forks,
+        license,
+        open_prs,
+        readme,
+        dirty_files,
     }
 }
 
@@ -462,6 +498,8 @@ fn load_home_data_local(path: &Path, repo: &str) -> HomeData {
     let setup_ok = items.iter().filter(|i| i.status == SetupStatus::Ok).count();
 
     let stack = detect_stack(path);
+    let readme = load_readme(path);
+    let dirty_files = load_dirty_files(path);
 
     HomeData {
         gh_description: None,
@@ -471,6 +509,12 @@ fn load_home_data_local(path: &Path, repo: &str) -> HomeData {
         setup_ok,
         setup_total,
         stack,
+        stars: None,
+        forks: None,
+        license: None,
+        open_prs: None,
+        readme,
+        dirty_files,
     }
 }
 
@@ -1246,6 +1290,7 @@ struct App {
     home_data: Option<HomeData>,
     home_remote_loaded: bool,
     home_loading: bool,
+    home_readme_scroll: u16,
     home_edit: Option<HomeEditField>,
     home_edit_input: String,
     home_save_msg: Option<String>,
@@ -2447,6 +2492,7 @@ impl App {
             home_data: None,
             home_remote_loaded: false,
             home_loading: false,
+            home_readme_scroll: 0,
             home_edit: None,
             home_edit_input: String::new(),
             home_save_msg: None,
@@ -2600,6 +2646,7 @@ impl App {
         self.home_data = Some(load_home_data_local(&path, &self.repo.clone()));
         self.home_remote_loaded = false;
         self.home_loading = false;
+        self.home_readme_scroll = 0;
         self.issues = vec![];
         self.issue_list_state = ListState::default();
         self.issues_error = None;
@@ -3295,6 +3342,12 @@ fn handle_home(app: &mut App, key: KeyCode) -> bool {
                 }
             }
         }
+        KeyCode::Char('j') | KeyCode::Down => {
+            app.home_readme_scroll = app.home_readme_scroll.saturating_add(3);
+        }
+        KeyCode::Char('k') | KeyCode::Up => {
+            app.home_readme_scroll = app.home_readme_scroll.saturating_sub(3);
+        }
         _ => {}
     }
     false
@@ -3645,30 +3698,84 @@ fn draw_home(frame: &mut Frame, app: &App) {
         let inner = block.inner(outer[2]);
         frame.render_widget(block, outer[2]);
 
+        // Split content: top (info+commits) / bottom (README)
+        let vsplit = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(38), Constraint::Min(0)])
+            .split(inner);
+
+        let top_area = vsplit[0];
+        let readme_area = vsplit[1];
+
+        // Top area: avatar | left_info | right_commits
         let owner = app.repo.split('/').next().unwrap_or("");
         let avatar_ansi = app.avatar_cache.get(owner);
         let avatar_w = if avatar_ansi.is_some() { 22u16 } else { 0 };
 
-        let split = Layout::default()
+        let top_split = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
                 Constraint::Length(avatar_w),
-                Constraint::Percentage(55),
-                Constraint::Percentage(45),
+                Constraint::Percentage(52),
+                Constraint::Percentage(48),
             ])
-            .split(inner);
+            .split(top_area);
 
-        // Avatar column
         if let Some(ansi) = avatar_ansi {
-            let avatar_lines = ansi_to_lines(ansi);
-            frame.render_widget(Paragraph::new(avatar_lines), split[0]);
+            frame.render_widget(Paragraph::new(ansi_to_lines(ansi)), top_split[0]);
         }
 
-        // Left column (info)
-        let left_area = split[1];
+        // ── Left info column ──────────────────────────────────────────
         let mut left: Vec<Line> = vec![Line::from("")];
 
-        // URL row (always shown if known)
+        // Stats row: ★ stars  ⑂ forks  ! issues  ↳ PRs  license
+        {
+            let mut stat_spans: Vec<Span> = vec![Span::raw("  ")];
+            let mut any = false;
+            if let Some(s) = data.stars {
+                stat_spans.push(Span::styled(format!("★ {s}"), Style::default().fg(C_YELLOW)));
+                stat_spans.push(Span::raw("   "));
+                any = true;
+            }
+            if let Some(f) = data.forks {
+                stat_spans.push(Span::styled(format!("⑂ {f}"), Style::default().fg(FG_DIM)));
+                stat_spans.push(Span::raw("   "));
+                any = true;
+            }
+            if let Some(n) = app
+                .active_project_idx
+                .and_then(|i| app.projects.get(i))
+                .and_then(|p| app.meta_cache.get(&p.repo))
+                .and_then(|m| m.open_issues)
+            {
+                let color = if n > 0 { C_RED } else { FG_XDIM };
+                stat_spans.push(Span::styled(format!("! {n}"), Style::default().fg(color)));
+                stat_spans.push(Span::raw("   "));
+                any = true;
+            }
+            if let Some(pr) = data.open_prs {
+                let color = if pr > 0 { C_PURPLE } else { FG_XDIM };
+                stat_spans.push(Span::styled(
+                    format!("↳ {pr} PR"),
+                    Style::default().fg(color),
+                ));
+                stat_spans.push(Span::raw("   "));
+                any = true;
+            }
+            if let Some(lic) = &data.license {
+                stat_spans.push(Span::styled(lic.clone(), Style::default().fg(FG_DIM)));
+                any = true;
+            } else if app.home_loading {
+                stat_spans.push(Span::styled("loading…", Style::default().fg(FG_XDIM)));
+                any = true;
+            }
+            if any {
+                left.push(Line::from(stat_spans));
+                left.push(Line::from(""));
+            }
+        }
+
+        // URL
         if !data.url.is_empty() {
             left.push(Line::from(vec![
                 Span::styled("  url      ", Style::default().fg(FG_DIM)),
@@ -3757,9 +3864,33 @@ fn draw_home(frame: &mut Frame, app: &App) {
             },
         ]));
 
-        frame.render_widget(Paragraph::new(left).wrap(Wrap { trim: false }), left_area);
+        // Dirty files
+        if !data.dirty_files.is_empty() {
+            left.push(Line::from(""));
+            left.push(Line::from(Span::styled(
+                "  unstaged ",
+                Style::default().fg(FG_DIM),
+            )));
+            for f in data.dirty_files.iter().take(6) {
+                left.push(Line::from(Span::styled(
+                    format!("    {f}"),
+                    Style::default().fg(C_YELLOW),
+                )));
+            }
+            if data.dirty_files.len() > 6 {
+                left.push(Line::from(Span::styled(
+                    format!("    +{} more", data.dirty_files.len() - 6),
+                    Style::default().fg(FG_XDIM),
+                )));
+            }
+        }
 
-        // Right: recent commits
+        frame.render_widget(
+            Paragraph::new(left).wrap(Wrap { trim: false }),
+            top_split[1],
+        );
+
+        // ── Right: recent commits ─────────────────────────────────────
         let mut right: Vec<Line> = vec![
             Line::from(Span::styled(
                 format!("  {I_COMMIT} recent commits"),
@@ -3798,7 +3929,60 @@ fn draw_home(frame: &mut Frame, app: &App) {
                 ]));
             }
         }
-        frame.render_widget(Paragraph::new(right).wrap(Wrap { trim: false }), split[2]);
+        frame.render_widget(
+            Paragraph::new(right).wrap(Wrap { trim: false }),
+            top_split[2],
+        );
+
+        // ── README section ────────────────────────────────────────────
+        let readme_block = Block::default()
+            .borders(Borders::TOP)
+            .title(Span::styled(" README ", Style::default().fg(FG_DIM)));
+        let readme_inner = readme_block.inner(readme_area);
+        frame.render_widget(readme_block, readme_area);
+
+        if let Some(readme) = &data.readme {
+            // Light markdown rendering: color headings, dim code fences
+            let lines: Vec<Line> = readme
+                .lines()
+                .map(|l| {
+                    if l.starts_with("# ") || l.starts_with("## ") || l.starts_with("### ") {
+                        Line::from(Span::styled(
+                            l.to_string(),
+                            Style::default()
+                                .fg(ACCENT)
+                                .add_modifier(Modifier::BOLD),
+                        ))
+                    } else if l.starts_with("```") || l.starts_with("~~~") {
+                        Line::from(Span::styled(l.to_string(), Style::default().fg(FG_XDIM)))
+                    } else {
+                        Line::from(Span::raw(l.to_string()))
+                    }
+                })
+                .collect();
+            frame.render_widget(
+                Paragraph::new(lines)
+                    .wrap(Wrap { trim: false })
+                    .scroll((app.home_readme_scroll, 0)),
+                readme_inner,
+            );
+        } else if app.home_loading {
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    "  loading README…",
+                    Style::default().fg(FG_XDIM),
+                )),
+                readme_inner,
+            );
+        } else {
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    "  No README found",
+                    Style::default().fg(FG_XDIM),
+                )),
+                readme_inner,
+            );
+        }
     } else {
         frame.render_widget(
             Paragraph::new(Span::styled(
@@ -3810,7 +3994,7 @@ fn draw_home(frame: &mut Frame, app: &App) {
         );
     }
 
-    // Edit input or save message
+    // Edit input or save message — keep exactly as before
     if let Some(field) = &app.home_edit {
         let label = match field {
             HomeEditField::Description => "description",
@@ -3853,6 +4037,7 @@ fn draw_home(frame: &mut Frame, app: &App) {
             ("e", "edit desc"),
             ("u", "edit homepage"),
             ("y", "copy url"),
+            ("jk", "scroll readme"),
             ("2", "issues"),
             ("3", "setup"),
             ("esc", "back"),
