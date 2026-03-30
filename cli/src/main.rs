@@ -129,6 +129,7 @@ struct RepoMeta {
     language: Option<String>,
     topics: Vec<String>,
     pushed_at: Option<String>, // ISO date string from GitHub
+    open_issues: Option<u32>,
 }
 
 #[derive(Clone)]
@@ -1656,7 +1657,7 @@ fn refresh_project_meta(repo: &str) -> Option<RepoMeta> {
             "view",
             repo,
             "--json",
-            "primaryLanguage,repositoryTopics,pushedAt",
+            "primaryLanguage,repositoryTopics,pushedAt,openIssues",
         ])
         .output()
         .ok()?;
@@ -1672,10 +1673,12 @@ fn refresh_project_meta(repo: &str) -> Option<RepoMeta> {
         .filter_map(|t| t["name"].as_str().map(|s| s.to_string()))
         .collect();
     let pushed_at = v["pushedAt"].as_str().map(|s| s.to_string());
+    let open_issues = v["openIssues"].as_u64().map(|n| n as u32);
     Some(RepoMeta {
         language,
         topics,
         pushed_at,
+        open_issues,
     })
 }
 
@@ -1702,7 +1705,7 @@ fn sync_meta(projects: &[Project]) -> HashMap<String, RepoMeta> {
                 "--limit",
                 "100",
                 "--json",
-                "name,primaryLanguage,repositoryTopics,pushedAt",
+                "name,primaryLanguage,repositoryTopics,pushedAt,openIssues",
             ])
             .output()
         else {
@@ -1732,12 +1735,14 @@ fn sync_meta(projects: &[Project]) -> HashMap<String, RepoMeta> {
                 .filter_map(|t| t["name"].as_str().map(|s| s.to_string()))
                 .collect();
             let pushed_at = item["pushedAt"].as_str().map(|s| s.to_string());
+            let open_issues = item["openIssues"].as_u64().map(|n| n as u32);
             cache.insert(
                 format!("{org}/{name}"),
                 RepoMeta {
                     language,
                     topics,
                     pushed_at,
+                    open_issues,
                 },
             );
         }
@@ -4220,8 +4225,8 @@ fn draw_projects(frame: &mut Frame, app: &App) {
             .split(inner);
 
         // Compute repo column width from actual names, bounded by terminal width.
-        // Fixed columns: marker(3) + lang(5) + branch(14) + git(12) + cfg(5) + pushed(7) = ~46
-        let fixed_cols: usize = 46;
+        // Fixed columns: marker(3) + lang(5) + branch(14) + git(12) + cfg(5) + iss(5) + pushed(7) = ~51
+        let fixed_cols: usize = 51;
         let max_name = app
             .projects
             .iter()
@@ -4235,8 +4240,8 @@ fn draw_projects(frame: &mut Frame, app: &App) {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 format!(
-                    "   {:<repo_col$}  {:<4}  {:<12}  {:<11}  {:<4}  {}",
-                    "repo", "lang", "branch", "changes", "cfg", "pushed"
+                    "   {:<repo_col$}  {:<4}  {:<12}  {:<11}  {:<4}  {:<3}  {}",
+                    "repo", "lang", "branch", "changes", "cfg", "iss", "pushed"
                 ),
                 Style::default().fg(FG_XDIM),
             ))),
@@ -4332,6 +4337,12 @@ fn draw_projects(frame: &mut Frame, app: &App) {
                         spans.extend(git_parts);
                         spans.push(Span::raw(git_pad));
                         spans.push(Span::styled(cfg_text, Style::default().fg(cfg_color)));
+                        let (iss_text, iss_color) = match meta.and_then(|m| m.open_issues) {
+                            Some(n) if n > 0 => (format!("!{n}  "), C_RED),
+                            Some(_) => ("·    ".to_string(), FG_XDIM),
+                            None => ("     ".to_string(), FG_XDIM),
+                        };
+                        spans.push(Span::styled(iss_text, Style::default().fg(iss_color)));
                         spans.push(Span::styled(format!("{:<5}", pushed), Style::default().fg(FG_XDIM)));
                         ListItem::new(Line::from(spans))
                     }
