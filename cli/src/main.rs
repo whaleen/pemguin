@@ -1657,7 +1657,7 @@ fn refresh_project_meta(repo: &str) -> Option<RepoMeta> {
             "view",
             repo,
             "--json",
-            "primaryLanguage,repositoryTopics,pushedAt,openIssues",
+            "primaryLanguage,repositoryTopics,pushedAt,issues",
         ])
         .output()
         .ok()?;
@@ -1673,7 +1673,7 @@ fn refresh_project_meta(repo: &str) -> Option<RepoMeta> {
         .filter_map(|t| t["name"].as_str().map(|s| s.to_string()))
         .collect();
     let pushed_at = v["pushedAt"].as_str().map(|s| s.to_string());
-    let open_issues = v["openIssues"].as_u64().map(|n| n as u32);
+    let open_issues = v["issues"]["totalCount"].as_u64().map(|n| n as u32);
     Some(RepoMeta {
         language,
         topics,
@@ -1705,7 +1705,7 @@ fn sync_meta(projects: &[Project]) -> HashMap<String, RepoMeta> {
                 "--limit",
                 "100",
                 "--json",
-                "name,primaryLanguage,repositoryTopics,pushedAt,openIssues",
+                "name,primaryLanguage,repositoryTopics,pushedAt,issues",
             ])
             .output()
         else {
@@ -1735,7 +1735,7 @@ fn sync_meta(projects: &[Project]) -> HashMap<String, RepoMeta> {
                 .filter_map(|t| t["name"].as_str().map(|s| s.to_string()))
                 .collect();
             let pushed_at = item["pushedAt"].as_str().map(|s| s.to_string());
-            let open_issues = item["openIssues"].as_u64().map(|n| n as u32);
+            let open_issues = item["issues"]["totalCount"].as_u64().map(|n| n as u32);
             cache.insert(
                 format!("{org}/{name}"),
                 RepoMeta {
