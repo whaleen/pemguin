@@ -18,7 +18,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Borders, Cell, List, ListItem, ListState, Paragraph, Row, Table, TableState, Wrap},
 };
 use regex::Regex;
 
@@ -1237,7 +1237,7 @@ struct App {
     // Projects (root screen)
     projects: Vec<Project>,
     project_entries: Vec<ProjectEntry>, // flat render list (Group headers + Item refs)
-    project_list_state: ListState,
+    project_list_state: TableState,
     active_project_idx: Option<usize>, // index into projects; set on drill-in
     projects_msg: Option<String>,      // transient status shown in footer
     projects_loading: bool,
@@ -2406,7 +2406,7 @@ impl App {
         if !global_prompts.is_empty() {
             prompt_ls.select(Some(0));
         }
-        let mut project_ls = ListState::default();
+        let mut project_ls = TableState::default();
         if let Some(first_item) = project_entries
             .iter()
             .position(|e| matches!(e, ProjectEntry::Item(_)))
@@ -2818,7 +2818,7 @@ impl App {
                         self.projects = projects;
                         self.project_entries = build_project_entries(&self.projects);
                         self.project_list_state = {
-                            let mut ls = ListState::default();
+                            let mut ls = TableState::default();
                             if let Some(first_item) = self
                                 .project_entries
                                 .iter()
@@ -4214,157 +4214,165 @@ fn draw_projects(frame: &mut Frame, app: &App) {
             outer[1],
         );
     } else {
-        // Split inner area: column header row (1 line) + list
-        let block = Block::default().borders(Borders::ALL).title(" projects ");
-        let inner = block.inner(outer[1]);
-        frame.render_widget(block, outer[1]);
-
-        let split = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Min(0)])
-            .split(inner);
-
-        // Compute repo column width from actual names, bounded by terminal width.
-        // Fixed columns: marker(3) + sep+lang(6) + sep+branch(14) + sep+changes(13) + sep+cfg(7) + sep+iss(6) + sep+pushed(7) = ~56
-        let fixed_cols: usize = 56;
-        let max_name = app
-            .projects
-            .iter()
-            .map(|p| p.repo.split('/').last().unwrap_or(&p.repo).len())
-            .max()
-            .unwrap_or(16);
-        let available = (frame.area().width as usize).saturating_sub(fixed_cols);
-        let repo_col = max_name.clamp(16, available.max(16));
-
-        // Column header
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                format!(
-                    "   {:<repo_col$}  {:<4}  {:<12}  {:<11}  {:<5}  {:<4}  {}",
-                    "repo", "lang", "branch", "changes", "cfg", "iss", "pushed"
-                ),
-                Style::default().fg(FG_XDIM),
-            ))),
-            split[0],
-        );
-
-        // Build list items from entries (groups + projects)
-        let items: Vec<ListItem> = app
+        // Build table rows from project entries (group headers + project items)
+        let rows: Vec<Row> = app
             .project_entries
             .iter()
-            .map(|entry| {
-                match entry {
-                    ProjectEntry::Group(name) => ListItem::new(Line::from(Span::styled(
+            .map(|entry| match entry {
+                ProjectEntry::Group(name) => Row::new(vec![
+                    Cell::from(Span::styled(
                         format!("  {name}"),
                         Style::default().fg(C_PURPLE).add_modifier(Modifier::BOLD),
-                    ))),
-                    ProjectEntry::Item(proj_idx) => {
-                        let p = &app.projects[*proj_idx];
-                        let meta = app.meta_cache.get(&p.repo);
-                        let active = app.active_project_idx == Some(*proj_idx);
+                    )),
+                    Cell::from(""),
+                    Cell::from(""),
+                    Cell::from(""),
+                    Cell::from(""),
+                    Cell::from(""),
+                    Cell::from(""),
+                ]),
+                ProjectEntry::Item(proj_idx) => {
+                    let p = &app.projects[*proj_idx];
+                    let meta = app.meta_cache.get(&p.repo);
+                    let active = app.active_project_idx == Some(*proj_idx);
 
-                        let lang = meta
-                            .and_then(|m| m.language.as_deref())
-                            .map(lang_short)
-                            .unwrap_or("");
-                        let pushed = meta
-                            .and_then(|m| m.pushed_at.as_deref())
-                            .map(relative_date)
-                            .unwrap_or_default();
-
-                        let repo_style = if active {
+                    // repo — active project shows bullet prefix
+                    let repo_display = p.repo.split('/').last().unwrap_or(&p.repo);
+                    let repo_text = if active {
+                        format!("{I_BULLET} {repo_display}")
+                    } else {
+                        repo_display.to_string()
+                    };
+                    let repo_cell = Cell::from(Span::styled(
+                        repo_text,
+                        if active {
                             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
                         } else {
                             Style::default()
-                        };
-                        let repo_display = p.repo.split('/').last().unwrap_or(&p.repo);
-                        let branch_display = if p.branch.len() > 10 {
-                            format!("{}~", &p.branch[..9])
-                        } else {
-                            p.branch.clone()
-                        };
+                        },
+                    ));
 
-                        // Compact git changes column: ●N ↑N ↓N (only non-zero parts shown)
-                        // Fixed width 11 chars to keep columns stable
-                        let mut git_parts: Vec<Span> = vec![];
-                        if p.dirty_count > 0 {
-                            git_parts.push(Span::styled(
-                                format!("●{} ", p.dirty_count),
-                                Style::default().fg(C_YELLOW),
-                            ));
-                        }
-                        if p.commits_ahead > 0 {
-                            git_parts.push(Span::styled(
-                                format!("↑{} ", p.commits_ahead),
-                                Style::default().fg(C_PURPLE),
-                            ));
-                        }
-                        if p.commits_behind > 0 {
-                            git_parts.push(Span::styled(
-                                format!("↓{} ", p.commits_behind),
-                                Style::default().fg(C_RED),
-                            ));
-                        }
-                        // Pad to fixed width so cfg column stays aligned
-                        let git_text_len: usize = git_parts.iter().map(|s| s.content.len()).sum();
-                        let git_pad = " ".repeat(11usize.saturating_sub(git_text_len));
+                    // lang
+                    let lang = meta
+                        .and_then(|m| m.language.as_deref())
+                        .map(lang_short)
+                        .unwrap_or("");
+                    let lang_cell =
+                        Cell::from(Span::styled(lang.to_string(), Style::default().fg(C_PURPLE)));
 
-                        // cfg: fixed 5 chars — 0 missing = dim dot, >0 = amber "Nmis"
-                        let missing = p.setup_total.saturating_sub(p.setup_ok);
-                        let (cfg_text, cfg_color) = if missing == 0 {
-                            ("·    ".to_string(), FG_XDIM)
-                        } else {
-                            (format!("{:<5}", format!("{missing}mis")), C_YELLOW)
-                        };
+                    // branch
+                    let branch_display = if p.branch.len() > 10 {
+                        format!("{}~", &p.branch[..9])
+                    } else {
+                        p.branch.clone()
+                    };
+                    let branch_cell = Cell::from(Span::styled(
+                        format!("{I_BRANCH} {branch_display}"),
+                        Style::default().fg(FG_DIM),
+                    ));
 
-                        // iss: fixed 4 chars — None = blank, 0 = dim dot, >0 = red "!N"
-                        let (iss_text, iss_color) = match meta.and_then(|m| m.open_issues) {
-                            Some(n) if n > 0 => (format!("{:<4}", format!("!{n}")), C_RED),
-                            Some(_) => ("·   ".to_string(), FG_XDIM),
-                            None => ("    ".to_string(), FG_XDIM),
-                        };
-
-                        // Marker: 3 cells
-                        let marker = if active {
-                            format!("{I_BULLET} ")
-                        } else {
-                            "   ".to_string()
-                        };
-
-                        // Each column separated by explicit "  " span so widths match header
-                        let mut spans = vec![
-                            Span::styled(marker, Style::default().fg(ACCENT)),
-                            Span::styled(format!("{:<repo_col$}", repo_display), repo_style),
-                            Span::raw("  "),
-                            Span::styled(format!("{:<4}", lang), Style::default().fg(C_PURPLE)),
-                            Span::raw("  "),
-                            Span::styled(
-                                format!("{I_BRANCH} {:<10}", branch_display),
-                                Style::default().fg(FG_DIM),
-                            ),
-                            Span::raw("  "),
-                        ];
-                        spans.extend(git_parts);
-                        spans.push(Span::raw(git_pad));
-                        spans.push(Span::raw("  "));
-                        spans.push(Span::styled(cfg_text, Style::default().fg(cfg_color)));
-                        spans.push(Span::raw("  "));
-                        spans.push(Span::styled(iss_text, Style::default().fg(iss_color)));
-                        spans.push(Span::raw("  "));
-                        spans.push(Span::styled(pushed, Style::default().fg(FG_XDIM)));
-                        ListItem::new(Line::from(spans))
+                    // changes — multi-colored spans in one cell
+                    let mut change_spans: Vec<Span> = vec![];
+                    if p.dirty_count > 0 {
+                        change_spans.push(Span::styled(
+                            format!("●{}", p.dirty_count),
+                            Style::default().fg(C_YELLOW),
+                        ));
                     }
+                    if p.commits_ahead > 0 {
+                        if !change_spans.is_empty() {
+                            change_spans.push(Span::raw(" "));
+                        }
+                        change_spans.push(Span::styled(
+                            format!("↑{}", p.commits_ahead),
+                            Style::default().fg(C_PURPLE),
+                        ));
+                    }
+                    if p.commits_behind > 0 {
+                        if !change_spans.is_empty() {
+                            change_spans.push(Span::raw(" "));
+                        }
+                        change_spans.push(Span::styled(
+                            format!("↓{}", p.commits_behind),
+                            Style::default().fg(C_RED),
+                        ));
+                    }
+                    let changes_cell = Cell::from(Line::from(change_spans));
+
+                    // cfg
+                    let missing = p.setup_total.saturating_sub(p.setup_ok);
+                    let cfg_cell = if missing == 0 {
+                        Cell::from(Span::styled("·", Style::default().fg(FG_XDIM)))
+                    } else {
+                        Cell::from(Span::styled(
+                            format!("{missing}mis"),
+                            Style::default().fg(C_YELLOW),
+                        ))
+                    };
+
+                    // iss
+                    let iss_cell = match meta.and_then(|m| m.open_issues) {
+                        Some(n) if n > 0 => Cell::from(Span::styled(
+                            format!("!{n}"),
+                            Style::default().fg(C_RED),
+                        )),
+                        Some(_) => Cell::from(Span::styled("·", Style::default().fg(FG_XDIM))),
+                        None => Cell::from(""),
+                    };
+
+                    // pushed
+                    let pushed = meta
+                        .and_then(|m| m.pushed_at.as_deref())
+                        .map(relative_date)
+                        .unwrap_or_default();
+                    let pushed_cell =
+                        Cell::from(Span::styled(pushed, Style::default().fg(FG_XDIM)));
+
+                    Row::new(vec![
+                        repo_cell,
+                        lang_cell,
+                        branch_cell,
+                        changes_cell,
+                        cfg_cell,
+                        iss_cell,
+                        pushed_cell,
+                    ])
                 }
             })
             .collect();
 
-        let mut ls = app.project_list_state.clone();
+        let header = Row::new(vec![
+            Cell::from("repo"),
+            Cell::from("lang"),
+            Cell::from("branch"),
+            Cell::from("changes"),
+            Cell::from("cfg"),
+            Cell::from("iss"),
+            Cell::from("pushed"),
+        ])
+        .style(Style::default().fg(FG_XDIM))
+        .bottom_margin(0);
+
+        let widths = [
+            Constraint::Min(16),    // repo — takes remaining space
+            Constraint::Length(4),  // lang
+            Constraint::Length(12), // branch (icon + space + name)
+            Constraint::Length(11), // changes
+            Constraint::Length(5),  // cfg
+            Constraint::Length(4),  // iss
+            Constraint::Length(5),  // pushed
+        ];
+
+        let mut ts = app.project_list_state.clone();
         frame.render_stateful_widget(
-            List::new(items)
-                .highlight_style(hl())
-                .highlight_symbol("> "),
-            split[1],
-            &mut ls,
+            Table::new(rows, widths)
+                .header(header)
+                .block(Block::default().borders(Borders::ALL).title(" projects "))
+                .row_highlight_style(hl())
+                .highlight_symbol("> ")
+                .column_spacing(2),
+            outer[1],
+            &mut ts,
         );
     }
 
