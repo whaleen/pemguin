@@ -487,6 +487,48 @@ enum SetupAction {
     Delete,
 }
 
+enum SetupRenderRow {
+    GroupHeader(&'static str),
+    Item(usize), // index into setup_items
+}
+
+fn setup_render_rows(items: &[SetupItem]) -> Vec<SetupRenderRow> {
+    let installed: Vec<usize> = items
+        .iter()
+        .enumerate()
+        .filter_map(|(i, it)| matches!(it.status, SetupStatus::Ok).then_some(i))
+        .collect();
+    let not_installed: Vec<usize> = items
+        .iter()
+        .enumerate()
+        .filter_map(|(i, it)| (!matches!(it.status, SetupStatus::Ok)).then_some(i))
+        .collect();
+    let mut rows = vec![];
+    if !installed.is_empty() {
+        rows.push(SetupRenderRow::GroupHeader("installed"));
+        for i in installed {
+            rows.push(SetupRenderRow::Item(i));
+        }
+    }
+    if !not_installed.is_empty() {
+        rows.push(SetupRenderRow::GroupHeader("not installed"));
+        for i in not_installed {
+            rows.push(SetupRenderRow::Item(i));
+        }
+    }
+    rows
+}
+
+// Returns the setup_items index for the currently selected render row, if it is an Item.
+fn selected_setup_item(items: &[SetupItem], list_state: &ListState) -> Option<usize> {
+    let sel = list_state.selected()?;
+    let rows = setup_render_rows(items);
+    match rows.get(sel)? {
+        SetupRenderRow::Item(i) => Some(*i),
+        SetupRenderRow::GroupHeader(_) => None,
+    }
+}
+
 #[derive(Clone)]
 struct SetupItem {
     label: &'static str,
@@ -2489,9 +2531,11 @@ impl App {
             if let Some(p) = self.projects.get(idx) {
                 let path = p.path.clone();
                 self.setup_items = scan_setup(&path);
-                if !self.setup_items.is_empty() {
-                    self.setup_list_state.select(Some(0));
-                }
+                // Select the first real Item row (skip GroupHeader)
+                let first = setup_render_rows(&self.setup_items)
+                    .iter()
+                    .position(|r| matches!(r, SetupRenderRow::Item(_)));
+                self.setup_list_state.select(first);
                 // Reload project prompts in case .prompts/ was just created
                 self.reload_project_prompts();
             }
@@ -4579,24 +4623,31 @@ fn handle_setup(app: &mut App, key: KeyCode) -> bool {
 
     match key {
         KeyCode::Down | KeyCode::Char('j') if !app.setup_items.is_empty() => {
-            let n = (app.setup_list_state.selected().unwrap_or(0) + 1) % app.setup_items.len();
-            app.setup_list_state.select(Some(n));
+            let rows = setup_render_rows(&app.setup_items);
+            let len = rows.len();
+            let cur = app.setup_list_state.selected().unwrap_or(0);
+            let mut next = (cur + 1) % len;
+            while matches!(rows[next], SetupRenderRow::GroupHeader(_)) {
+                next = (next + 1) % len;
+            }
+            app.setup_list_state.select(Some(next));
         }
         KeyCode::Up | KeyCode::Char('k') if !app.setup_items.is_empty() => {
-            let len = app.setup_items.len();
-            let n = app
-                .setup_list_state
-                .selected()
-                .map(|i| if i == 0 { len - 1 } else { i - 1 })
-                .unwrap_or(0);
-            app.setup_list_state.select(Some(n));
+            let rows = setup_render_rows(&app.setup_items);
+            let len = rows.len();
+            let cur = app.setup_list_state.selected().unwrap_or(0);
+            let mut prev = if cur == 0 { len - 1 } else { cur - 1 };
+            while matches!(rows[prev], SetupRenderRow::GroupHeader(_)) {
+                prev = if prev == 0 { len - 1 } else { prev - 1 };
+            }
+            app.setup_list_state.select(Some(prev));
         }
         KeyCode::Enter => {
-            if let Some(sel) = app.setup_list_state.selected() {
+            if let Some(item_idx) = selected_setup_item(&app.setup_items, &app.setup_list_state) {
                 if let Some(idx) = app.active_project_idx {
                     if let Some(p) = app.projects.get(idx) {
                         let path = p.path.clone();
-                        let item = app.setup_items[sel].clone();
+                        let item = app.setup_items[item_idx].clone();
                         app.setup_message = Some(
                             apply_setup_item(&path, &item, SetupAction::Apply)
                                 .unwrap_or_else(|e| format!("Error: {e}")),
@@ -4607,11 +4658,11 @@ fn handle_setup(app: &mut App, key: KeyCode) -> bool {
             }
         }
         KeyCode::Char('e') => {
-            if let Some(sel) = app.setup_list_state.selected() {
+            if let Some(item_idx) = selected_setup_item(&app.setup_items, &app.setup_list_state) {
                 if let Some(idx) = app.active_project_idx {
                     if let Some(p) = app.projects.get(idx) {
                         let path = p.path.clone();
-                        let item = app.setup_items[sel].clone();
+                        let item = app.setup_items[item_idx].clone();
                         match edit_setup_item(&path, &item) {
                             Ok(path) => {
                                 app.pending_editor = Some(path);
@@ -4624,11 +4675,11 @@ fn handle_setup(app: &mut App, key: KeyCode) -> bool {
             }
         }
         KeyCode::Char('d') => {
-            if let Some(sel) = app.setup_list_state.selected() {
+            if let Some(item_idx) = selected_setup_item(&app.setup_items, &app.setup_list_state) {
                 if let Some(idx) = app.active_project_idx {
                     if let Some(p) = app.projects.get(idx) {
                         let path = p.path.clone();
-                        let item = app.setup_items[sel].clone();
+                        let item = app.setup_items[item_idx].clone();
                         app.pending_delete = Some(DeleteConfirm {
                             title: format!("Delete config item {}?", item.label),
                             detail: item.detail.to_string(),
@@ -4642,11 +4693,11 @@ fn handle_setup(app: &mut App, key: KeyCode) -> bool {
             }
         }
         KeyCode::Char('R') => {
-            if let Some(sel) = app.setup_list_state.selected() {
+            if let Some(item_idx) = selected_setup_item(&app.setup_items, &app.setup_list_state) {
                 if let Some(idx) = app.active_project_idx {
                     if let Some(p) = app.projects.get(idx) {
                         let path = p.path.clone();
-                        let item = app.setup_items[sel].clone();
+                        let item = app.setup_items[item_idx].clone();
                         app.setup_message = Some(
                             apply_setup_item(&path, &item, SetupAction::Reset)
                                 .unwrap_or_else(|e| format!("Error: {e}")),
@@ -4670,11 +4721,11 @@ fn handle_setup(app: &mut App, key: KeyCode) -> bool {
             app.refresh_setup();
         }
         KeyCode::Char('g') => {
-            if let Some(sel) = app.setup_list_state.selected() {
+            if let Some(item_idx) = selected_setup_item(&app.setup_items, &app.setup_list_state) {
                 if let Some(idx) = app.active_project_idx {
                     if let Some(p) = app.projects.get(idx) {
                         let path = p.path.clone();
-                        let item = app.setup_items[sel].clone();
+                        let item = app.setup_items[item_idx].clone();
                         if let Some(gip) = item.gitignore_path {
                             let add = !item.gitignored;
                             app.setup_message = Some(
@@ -4690,10 +4741,10 @@ fn handle_setup(app: &mut App, key: KeyCode) -> bool {
             }
         }
         KeyCode::Char('f') => {
-            if let Some(sel) = app.setup_list_state.selected() {
+            if let Some(item_idx) = selected_setup_item(&app.setup_items, &app.setup_list_state) {
                 if let Some(idx) = app.active_project_idx {
                     if let Some(p) = app.projects.get(idx) {
-                        if app.setup_items[sel].label == ".pemguin.toml" {
+                        if app.setup_items[item_idx].label == ".pemguin.toml" {
                             let config = load_project_pemguin_config(&p.path);
                             app.setup_toml_editor = Some(TomlEditorState {
                                 project_path: p.path.clone(),
@@ -4829,37 +4880,59 @@ fn draw_setup(frame: &mut Frame, app: &App) {
             );
         }
     } else {
+        let msg_h = if app.setup_message.is_some() { 3u16 } else { 0 };
         let inner = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
+                Constraint::Length(1),
                 Constraint::Min(0),
-                Constraint::Length(if app.setup_message.is_some() { 3 } else { 0 }),
+                Constraint::Length(msg_h),
             ])
             .split(outer[2]);
 
-        let items: Vec<ListItem> = app
-            .setup_items
+        // Column headers
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::raw("        "), // border(1) + highlight(2) + icon(5)
+                Span::styled(format!("{:<26}", "item"), Style::default().fg(FG_DIM).add_modifier(Modifier::BOLD)),
+                Span::styled("git  ", Style::default().fg(FG_DIM).add_modifier(Modifier::BOLD)),
+                Span::styled("detail", Style::default().fg(FG_DIM).add_modifier(Modifier::BOLD)),
+            ])),
+            inner[0],
+        );
+
+        let render_rows = setup_render_rows(&app.setup_items);
+        let items: Vec<ListItem> = render_rows
             .iter()
-            .map(|item| {
-                let (icon, icon_style) = match item.status {
-                    SetupStatus::Ok => (I_CHECK, Style::default().fg(C_GREEN)),
-                    SetupStatus::Missing => (I_CROSS, Style::default().fg(C_RED)),
-                    SetupStatus::Stale => (I_WARN, Style::default().fg(C_YELLOW)),
-                };
-                ListItem::new(Line::from(vec![
-                    Span::styled(format!(" {icon}  "), icon_style),
-                    Span::styled(format!("{:<26}", item.label), Style::default()),
-                    if item.gitignore_path.is_some() {
-                        if item.gitignored {
-                            Span::styled(" ↓ ", Style::default().fg(C_GREEN).add_modifier(Modifier::DIM))
+            .map(|row| match row {
+                SetupRenderRow::GroupHeader(label) => ListItem::new(Line::from(vec![
+                    Span::styled(
+                        format!(" {label}"),
+                        Style::default().fg(FG_DIM).add_modifier(Modifier::BOLD),
+                    ),
+                ])),
+                SetupRenderRow::Item(i) => {
+                    let item = &app.setup_items[*i];
+                    let (icon, icon_style) = match item.status {
+                        SetupStatus::Ok => (I_CHECK, Style::default().fg(C_GREEN)),
+                        SetupStatus::Missing => (I_CROSS, Style::default().fg(C_RED)),
+                        SetupStatus::Stale => (I_WARN, Style::default().fg(C_YELLOW)),
+                    };
+                    ListItem::new(Line::from(vec![
+                        Span::styled(format!(" {icon}  "), icon_style),
+                        Span::styled(format!("{:<26}", item.label), Style::default()),
+                        if item.gitignore_path.is_some() {
+                            if item.gitignored {
+                                Span::styled("↓  ", Style::default().fg(C_GREEN).add_modifier(Modifier::DIM))
+                            } else {
+                                Span::styled("○  ", Style::default().fg(FG_XDIM))
+                            }
                         } else {
-                            Span::styled(" ○ ", Style::default().fg(FG_XDIM))
-                        }
-                    } else {
-                        Span::raw("   ")
-                    },
-                    Span::styled(item.detail, Style::default().fg(FG_DIM)),
-                ]))
+                            Span::raw("   ")
+                        },
+                        Span::styled(item.detail, Style::default().fg(FG_DIM)),
+                    ]))
+                }
             })
             .collect();
 
@@ -4869,7 +4942,7 @@ fn draw_setup(frame: &mut Frame, app: &App) {
                 .block(Block::default().borders(Borders::ALL).title(" config "))
                 .highlight_style(hl())
                 .highlight_symbol("> "),
-            inner[0],
+            inner[1],
             &mut ls,
         );
 
@@ -4892,7 +4965,7 @@ fn draw_setup(frame: &mut Frame, app: &App) {
                     Style::default().fg(color),
                 ))
                 .block(Block::default().borders(Borders::ALL)),
-                inner[1],
+                inner[2],
             );
         }
     }
