@@ -157,8 +157,9 @@ struct Project {
     group: String, // parent dir name relative to base; "" for top-level repos
     repo: String,  // "owner/repo" or dir name
     branch: String,
-    is_dirty: bool,
+    dirty_count: u32,  // number of uncommitted changes
     commits_ahead: u32,
+    commits_behind: u32,
     setup_ok: usize,
     setup_total: usize,
 }
@@ -1542,7 +1543,7 @@ fn project_info(path: &Path, group: String) -> Option<Project> {
                 .unwrap_or("?")
                 .to_string()
         });
-    let (branch, is_dirty, ahead) = git_status_summary(path);
+    let (branch, dirty_count, ahead, behind) = git_status_summary(path);
     let setup_items = scan_setup(path);
     let setup_total = setup_items.len();
     let setup_ok = setup_items
@@ -1554,22 +1555,24 @@ fn project_info(path: &Path, group: String) -> Option<Project> {
         group,
         repo,
         branch,
-        is_dirty,
+        dirty_count,
         commits_ahead: ahead,
+        commits_behind: behind,
         setup_ok,
         setup_total,
     })
 }
 
-fn git_status_summary(path: &Path) -> (String, bool, u32) {
+fn git_status_summary(path: &Path) -> (String, u32, u32, u32) {
     let out = match git_in(path, &["status", "--porcelain=2", "--branch"]) {
         Some(s) => s,
-        None => return ("?".to_string(), false, 0),
+        None => return ("?".to_string(), 0, 0, 0),
     };
 
     let mut branch = "?".to_string();
-    let mut ahead = 0;
-    let mut is_dirty = false;
+    let mut ahead = 0u32;
+    let mut behind = 0u32;
+    let mut dirty_count = 0u32;
 
     for line in out.lines() {
         if let Some(head) = line.strip_prefix("# branch.head ") {
@@ -1582,16 +1585,18 @@ fn git_status_summary(path: &Path) -> (String, bool, u32) {
             for part in ab.split_whitespace() {
                 if let Some(n) = part.strip_prefix('+') {
                     ahead = n.parse().unwrap_or(0);
+                } else if let Some(n) = part.strip_prefix('-') {
+                    behind = n.parse().unwrap_or(0);
                 }
             }
             continue;
         }
         if !line.starts_with('#') && !line.is_empty() {
-            is_dirty = true;
+            dirty_count += 1;
         }
     }
 
-    (branch, is_dirty, ahead)
+    (branch, dirty_count, ahead, behind)
 }
 
 fn build_project_entries(projects: &[Project]) -> Vec<ProjectEntry> {
@@ -4215,8 +4220,8 @@ fn draw_projects(frame: &mut Frame, app: &App) {
             .split(inner);
 
         // Compute repo column width from actual names, bounded by terminal width.
-        // Fixed columns consume ~52 chars (marker+lang+branch+status+ahead+cfg+pushed+gaps).
-        let fixed_cols: usize = 52;
+        // Fixed columns: marker(3) + lang(5) + branch(14) + git(12) + cfg(5) + pushed(7) = ~46
+        let fixed_cols: usize = 46;
         let max_name = app
             .projects
             .iter()
@@ -4230,8 +4235,8 @@ fn draw_projects(frame: &mut Frame, app: &App) {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 format!(
-                    "  {:<repo_col$}  {:<4}  {:<12}  {:<6}  {:<4}  {:<4}  {}",
-                    "repo", "lang", "branch", "status", "↑", "cfg", "pushed"
+                    "   {:<repo_col$}  {:<4}  {:<12}  {:<11}  {:<4}  {}",
+                    "repo", "lang", "branch", "changes", "cfg", "pushed"
                 ),
                 Style::default().fg(FG_XDIM),
             ))),
@@ -4275,42 +4280,47 @@ fn draw_projects(frame: &mut Frame, app: &App) {
                             p.branch.clone()
                         };
 
-                        // Icons are double-width in terminal; compensate padding to keep columns stable
-                        let status = if p.is_dirty {
-                            Span::styled(
-                                format!(" {I_WARN} dirty  "),
+                        // Compact git changes column: ●N ↑N ↓N (only non-zero parts shown)
+                        // Fixed width 11 chars to keep columns stable
+                        let mut git_parts: Vec<Span> = vec![];
+                        if p.dirty_count > 0 {
+                            git_parts.push(Span::styled(
+                                format!("●{} ", p.dirty_count),
                                 Style::default().fg(C_YELLOW),
-                            )
-                        } else {
-                            Span::styled(
-                                format!(" {I_CHECK} clean  "),
-                                Style::default().fg(C_GREEN),
-                            )
-                        };
-                        // Both states must be same cell width: icon(2) + space(1) + 2chars + padding = 5 cells
-                        let ahead = if p.commits_ahead > 0 {
-                            Span::styled(
-                                format!("{I_AHEAD} {:<2} ", p.commits_ahead),
+                            ));
+                        }
+                        if p.commits_ahead > 0 {
+                            git_parts.push(Span::styled(
+                                format!("↑{} ", p.commits_ahead),
                                 Style::default().fg(C_PURPLE),
-                            )
+                            ));
+                        }
+                        if p.commits_behind > 0 {
+                            git_parts.push(Span::styled(
+                                format!("↓{} ", p.commits_behind),
+                                Style::default().fg(C_RED),
+                            ));
+                        }
+                        // Pad to fixed width so cfg column stays aligned
+                        let git_text_len: usize = git_parts.iter().map(|s| s.content.len()).sum();
+                        let git_pad = " ".repeat(11usize.saturating_sub(git_text_len));
+
+                        // cfg: show missing count only — 0 missing = dim dot, >0 = amber count
+                        let missing = p.setup_total.saturating_sub(p.setup_ok);
+                        let (cfg_text, cfg_color) = if missing == 0 {
+                            ("·    ".to_string(), FG_XDIM)
                         } else {
-                            Span::raw("     ")
+                            (format!("{missing}mis "), C_YELLOW)
                         };
-                        let cfg_color = if p.setup_ok == p.setup_total {
-                            C_GREEN
-                        } else if p.setup_ok == 0 {
-                            C_RED
-                        } else {
-                            C_YELLOW
-                        };
-                        // Marker: both states = 3 cells (NF icon is 2 cells + 1 space, or 3 plain spaces)
+
+                        // Marker: 3 cells
                         let marker = if active {
                             format!("{I_BULLET} ")
                         } else {
                             "   ".to_string()
                         };
 
-                        ListItem::new(Line::from(vec![
+                        let mut spans = vec![
                             Span::styled(marker, Style::default().fg(ACCENT)),
                             Span::styled(format!("{:<repo_col$}", repo_display), repo_style),
                             Span::styled(format!(" {:<3} ", lang), Style::default().fg(C_PURPLE)),
@@ -4318,14 +4328,12 @@ fn draw_projects(frame: &mut Frame, app: &App) {
                                 format!(" {I_BRANCH} {:<9}", branch_display),
                                 Style::default().fg(FG_DIM),
                             ),
-                            status,
-                            ahead,
-                            Span::styled(
-                                format!("{:<4}", format!("{}/{}", p.setup_ok, p.setup_total)),
-                                Style::default().fg(cfg_color),
-                            ),
-                            Span::styled(format!("  {:<5}", pushed), Style::default().fg(FG_XDIM)),
-                        ]))
+                        ];
+                        spans.extend(git_parts);
+                        spans.push(Span::raw(git_pad));
+                        spans.push(Span::styled(cfg_text, Style::default().fg(cfg_color)));
+                        spans.push(Span::styled(format!("{:<5}", pushed), Style::default().fg(FG_XDIM)));
+                        ListItem::new(Line::from(spans))
                     }
                 }
             })
