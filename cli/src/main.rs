@@ -4225,8 +4225,8 @@ fn draw_projects(frame: &mut Frame, app: &App) {
             .split(inner);
 
         // Compute repo column width from actual names, bounded by terminal width.
-        // Fixed columns: marker(3) + lang(5) + branch(14) + git(12) + cfg(5) + iss(5) + pushed(7) = ~51
-        let fixed_cols: usize = 51;
+        // Fixed columns: marker(3) + sep+lang(6) + sep+branch(14) + sep+changes(13) + sep+cfg(7) + sep+iss(6) + sep+pushed(7) = ~56
+        let fixed_cols: usize = 56;
         let max_name = app
             .projects
             .iter()
@@ -4240,7 +4240,7 @@ fn draw_projects(frame: &mut Frame, app: &App) {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 format!(
-                    "   {:<repo_col$}  {:<4}  {:<12}  {:<11}  {:<4}  {:<3}  {}",
+                    "   {:<repo_col$}  {:<4}  {:<12}  {:<11}  {:<5}  {:<4}  {}",
                     "repo", "lang", "branch", "changes", "cfg", "iss", "pushed"
                 ),
                 Style::default().fg(FG_XDIM),
@@ -4277,10 +4277,9 @@ fn draw_projects(frame: &mut Frame, app: &App) {
                         } else {
                             Style::default()
                         };
-                        let marker = if active { "• " } else { "  " };
                         let repo_display = p.repo.split('/').last().unwrap_or(&p.repo);
-                        let branch_display = if p.branch.len() > 12 {
-                            format!("{}~", &p.branch[..11])
+                        let branch_display = if p.branch.len() > 10 {
+                            format!("{}~", &p.branch[..9])
                         } else {
                             p.branch.clone()
                         };
@@ -4310,12 +4309,19 @@ fn draw_projects(frame: &mut Frame, app: &App) {
                         let git_text_len: usize = git_parts.iter().map(|s| s.content.len()).sum();
                         let git_pad = " ".repeat(11usize.saturating_sub(git_text_len));
 
-                        // cfg: show missing count only — 0 missing = dim dot, >0 = amber count
+                        // cfg: fixed 5 chars — 0 missing = dim dot, >0 = amber "Nmis"
                         let missing = p.setup_total.saturating_sub(p.setup_ok);
                         let (cfg_text, cfg_color) = if missing == 0 {
                             ("·    ".to_string(), FG_XDIM)
                         } else {
-                            (format!("{missing}mis "), C_YELLOW)
+                            (format!("{:<5}", format!("{missing}mis")), C_YELLOW)
+                        };
+
+                        // iss: fixed 4 chars — None = blank, 0 = dim dot, >0 = red "!N"
+                        let (iss_text, iss_color) = match meta.and_then(|m| m.open_issues) {
+                            Some(n) if n > 0 => (format!("{:<4}", format!("!{n}")), C_RED),
+                            Some(_) => ("·   ".to_string(), FG_XDIM),
+                            None => ("    ".to_string(), FG_XDIM),
                         };
 
                         // Marker: 3 cells
@@ -4325,25 +4331,27 @@ fn draw_projects(frame: &mut Frame, app: &App) {
                             "   ".to_string()
                         };
 
+                        // Each column separated by explicit "  " span so widths match header
                         let mut spans = vec![
                             Span::styled(marker, Style::default().fg(ACCENT)),
                             Span::styled(format!("{:<repo_col$}", repo_display), repo_style),
-                            Span::styled(format!(" {:<3} ", lang), Style::default().fg(C_PURPLE)),
+                            Span::raw("  "),
+                            Span::styled(format!("{:<4}", lang), Style::default().fg(C_PURPLE)),
+                            Span::raw("  "),
                             Span::styled(
-                                format!(" {I_BRANCH} {:<9}", branch_display),
+                                format!("{I_BRANCH} {:<10}", branch_display),
                                 Style::default().fg(FG_DIM),
                             ),
+                            Span::raw("  "),
                         ];
                         spans.extend(git_parts);
                         spans.push(Span::raw(git_pad));
+                        spans.push(Span::raw("  "));
                         spans.push(Span::styled(cfg_text, Style::default().fg(cfg_color)));
-                        let (iss_text, iss_color) = match meta.and_then(|m| m.open_issues) {
-                            Some(n) if n > 0 => (format!("!{n}  "), C_RED),
-                            Some(_) => ("·    ".to_string(), FG_XDIM),
-                            None => ("     ".to_string(), FG_XDIM),
-                        };
+                        spans.push(Span::raw("  "));
                         spans.push(Span::styled(iss_text, Style::default().fg(iss_color)));
-                        spans.push(Span::styled(format!("{:<5}", pushed), Style::default().fg(FG_XDIM)));
+                        spans.push(Span::raw("  "));
+                        spans.push(Span::styled(pushed, Style::default().fg(FG_XDIM)));
                         ListItem::new(Line::from(spans))
                     }
                 }
