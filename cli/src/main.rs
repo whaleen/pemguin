@@ -4236,12 +4236,12 @@ fn draw_projects(frame: &mut Frame, app: &App) {
                     let meta = app.meta_cache.get(&p.repo);
                     let active = app.active_project_idx == Some(*proj_idx);
 
-                    // repo — active project shows bullet prefix
+                    // repo — active project shows bullet, others show folder icon
                     let repo_display = p.repo.split('/').last().unwrap_or(&p.repo);
                     let repo_text = if active {
                         format!("{I_BULLET} {repo_display}")
                     } else {
-                        repo_display.to_string()
+                        format!("{I_PROJECTS} {repo_display}")
                     };
                     let repo_cell = Cell::from(Span::styled(
                         repo_text,
