@@ -4313,11 +4313,10 @@ fn draw_projects(frame: &mut Frame, app: &App) {
                     // iss
                     let iss_cell = match meta.and_then(|m| m.open_issues) {
                         Some(n) if n > 0 => Cell::from(Span::styled(
-                            format!("!{n}"),
+                            format!("{n}"),
                             Style::default().fg(C_RED),
                         )),
-                        Some(_) => Cell::from(Span::styled("·", Style::default().fg(FG_XDIM))),
-                        None => Cell::from(""),
+                        _ => Cell::from(Span::styled("0", Style::default().fg(FG_XDIM))),
                     };
 
                     // pushed
