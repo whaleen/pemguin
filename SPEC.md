@@ -81,6 +81,7 @@ Feature source of truth. Update this when features ship, change, or get cut.
 
 - ✅ Read installed skills from `skills-lock.json`
 - ✅ Show skill name, source repo, description
+- ✅ Browse skills.sh registry via `f` (launches `npx skills find` interactively, reloads list on exit)
 - 📋 Install skill from within pm
 - 📋 Remove skill from within pm
 

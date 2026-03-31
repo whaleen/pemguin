@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -135,9 +135,39 @@ struct RepoMeta {
 #[derive(Clone)]
 struct Prompt {
     name: String,
+    group: Option<String>,
     body: String,
     preview: String,
     placeholders: Vec<String>,
+}
+
+enum PromptDisplayRow {
+    GroupHeader(String),
+    Item(usize), // index into prompts vec
+}
+
+fn build_prompt_display_rows(prompts: &[Prompt]) -> Vec<PromptDisplayRow> {
+    let mut rows = Vec::new();
+    // Ungrouped prompts first
+    for (i, p) in prompts.iter().enumerate() {
+        if p.group.is_none() {
+            rows.push(PromptDisplayRow::Item(i));
+        }
+    }
+    // Then grouped, sorted by group name
+    let mut groups: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (i, p) in prompts.iter().enumerate() {
+        if let Some(g) = &p.group {
+            groups.entry(g.clone()).or_default().push(i);
+        }
+    }
+    for (group_name, indices) in groups {
+        rows.push(PromptDisplayRow::GroupHeader(group_name));
+        for i in indices {
+            rows.push(PromptDisplayRow::Item(i));
+        }
+    }
+    rows
 }
 
 struct MemoryFile {
@@ -1268,6 +1298,7 @@ struct App {
     project_prompts: Vec<Prompt>, // loaded from <project>/.prompts/ on drill-in
     prompts_view: PromptsView,
     prompts: Vec<Prompt>, // current display list (points at global or project)
+    prompt_display_rows: Vec<PromptDisplayRow>, // flat + grouped rows for rendering
     prompt_state: PromptState,
     prompt_input: String,
     prompt_inputting: bool,
@@ -1379,36 +1410,48 @@ fn load_prompts_from(dir: &Path) -> Vec<Prompt> {
         .map(|r| r.filter_map(|e| e.ok()).collect())
         .unwrap_or_default();
     entries.sort_by_key(|e: &std::fs::DirEntry| e.file_name());
-    entries.retain(|e| {
-        e.path()
-            .extension()
-            .and_then(|s| s.to_str())
-            .map(|s| s == "md")
-            .unwrap_or(false)
-    });
 
-    entries
-        .iter()
-        .filter_map(|entry| {
-            let path = entry.path();
-            let name = path.file_stem()?.to_str()?.to_string();
-            let content = fs::read_to_string(&path).ok()?;
-            let body = extract_body(&content);
-            let mut placeholders: Vec<String> = Vec::new();
-            for cap in re.captures_iter(&body) {
-                let p = cap[1].to_string();
-                if !placeholders.contains(&p) {
-                    placeholders.push(p);
-                }
+    let parse_prompt = |path: &std::path::Path, group: Option<String>| -> Option<Prompt> {
+        if path.extension().and_then(|s| s.to_str()) != Some("md") {
+            return None;
+        }
+        let name = path.file_stem()?.to_str()?.to_string();
+        let content = fs::read_to_string(path).ok()?;
+        let body = extract_body(&content);
+        let mut placeholders: Vec<String> = Vec::new();
+        for cap in re.captures_iter(&body) {
+            let p = cap[1].to_string();
+            if !placeholders.contains(&p) {
+                placeholders.push(p);
             }
-            Some(Prompt {
-                name,
-                body,
-                preview: content,
-                placeholders,
-            })
-        })
-        .collect()
+        }
+        Some(Prompt { name, group, body, preview: content, placeholders })
+    };
+
+    let mut prompts = Vec::new();
+
+    // Root-level .md files — ungrouped
+    for entry in entries.iter().filter(|e| e.path().is_file()) {
+        if let Some(p) = parse_prompt(&entry.path(), None) {
+            prompts.push(p);
+        }
+    }
+
+    // Subdirectories — each dir name becomes a group
+    for entry in entries.iter().filter(|e| e.path().is_dir()) {
+        let group_name = entry.file_name().to_string_lossy().into_owned();
+        let mut subentries: Vec<_> = fs::read_dir(entry.path())
+            .map(|r| r.filter_map(|e| e.ok()).collect())
+            .unwrap_or_default();
+        subentries.sort_by_key(|e: &std::fs::DirEntry| e.file_name());
+        for subentry in subentries.iter().filter(|e| e.path().is_file()) {
+            if let Some(p) = parse_prompt(&subentry.path(), Some(group_name.clone())) {
+                prompts.push(p);
+            }
+        }
+    }
+
+    prompts
 }
 
 fn global_prompts_dir() -> PathBuf {
@@ -2446,11 +2489,11 @@ impl App {
         let projects = vec![];
         let project_entries = vec![];
         let global_prompts = load_prompts_from(&global_prompts_dir());
+        let init_display_rows = build_prompt_display_rows(&global_prompts);
 
         let mut prompt_ls = ListState::default();
-        if !global_prompts.is_empty() {
-            prompt_ls.select(Some(0));
-        }
+        let first_prompt = init_display_rows.iter().position(|r| matches!(r, PromptDisplayRow::Item(_)));
+        prompt_ls.select(first_prompt);
         let mut project_ls = TableState::default();
         if let Some(first_item) = project_entries
             .iter()
@@ -2471,6 +2514,7 @@ impl App {
             project_prompts: vec![],
             prompts_view: PromptsView::Global,
             prompts,
+            prompt_display_rows: init_display_rows,
             prompt_state: PromptState::Browse {
                 list_state: prompt_ls,
             },
@@ -2550,10 +2594,10 @@ impl App {
             PromptsView::Global => self.global_prompts.clone(),
             PromptsView::Project => self.project_prompts.clone(),
         };
+        self.prompt_display_rows = build_prompt_display_rows(&self.prompts);
         let mut ls = ListState::default();
-        if !self.prompts.is_empty() {
-            ls.select(Some(0));
-        }
+        let first = self.prompt_display_rows.iter().position(|r| matches!(r, PromptDisplayRow::Item(_)));
+        ls.select(first);
         self.prompt_state = PromptState::Browse { list_state: ls };
         self.prompt_message = None;
     }
@@ -2564,6 +2608,7 @@ impl App {
                 self.project_prompts = load_prompts_from(&p.path.join(".prompts"));
                 if self.prompts_view == PromptsView::Project {
                     self.prompts = self.project_prompts.clone();
+                    self.prompt_display_rows = build_prompt_display_rows(&self.prompts);
                 }
             }
         }
@@ -2612,7 +2657,11 @@ impl App {
 
     fn selected_prompt_idx(&self) -> Option<usize> {
         if let PromptState::Browse { list_state } = &self.prompt_state {
-            list_state.selected()
+            let display_idx = list_state.selected()?;
+            match self.prompt_display_rows.get(display_idx)? {
+                PromptDisplayRow::Item(i) => Some(*i),
+                PromptDisplayRow::GroupHeader(_) => None,
+            }
         } else {
             None
         }
@@ -3124,18 +3173,30 @@ fn handle_prompts(app: &mut App, key: KeyCode) -> bool {
 
     match &mut app.prompt_state {
         PromptState::Browse { list_state } => {
-            let len = app.prompts.len();
+            let len = app.prompt_display_rows.len();
             match key {
                 KeyCode::Down | KeyCode::Char('j') => {
-                    let n = (list_state.selected().unwrap_or(0) + 1) % len;
-                    list_state.select(Some(n));
+                    if len > 0 {
+                        let mut n = (list_state.selected().unwrap_or(0) + 1) % len;
+                        let mut guard = 0;
+                        while matches!(app.prompt_display_rows.get(n), Some(PromptDisplayRow::GroupHeader(_))) && guard < len {
+                            n = (n + 1) % len;
+                            guard += 1;
+                        }
+                        list_state.select(Some(n));
+                    }
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
-                    let n = list_state
-                        .selected()
-                        .map(|i| if i == 0 { len - 1 } else { i - 1 })
-                        .unwrap_or(0);
-                    list_state.select(Some(n));
+                    if len > 0 {
+                        let current = list_state.selected().unwrap_or(0);
+                        let mut n = if current == 0 { len - 1 } else { current - 1 };
+                        let mut guard = 0;
+                        while matches!(app.prompt_display_rows.get(n), Some(PromptDisplayRow::GroupHeader(_))) && guard < len {
+                            n = if n == 0 { len - 1 } else { n - 1 };
+                            guard += 1;
+                        }
+                        list_state.select(Some(n));
+                    }
                 }
                 KeyCode::Enter => {
                     if let Some(idx) = list_state.selected() {
@@ -4132,11 +4193,15 @@ fn draw_prompts(frame: &mut Frame, app: &App) {
     ]);
     frame.render_widget(Paragraph::new(subnav), list_split[0]);
 
-    let items: Vec<ListItem> = app
-        .prompts
-        .iter()
-        .map(|p| ListItem::new(p.name.clone()))
-        .collect();
+    let items: Vec<ListItem> = app.prompt_display_rows.iter().map(|row| match row {
+        PromptDisplayRow::GroupHeader(name) => ListItem::new(Line::from(vec![
+            Span::styled(
+                format!(" {name}"),
+                Style::default().fg(FG_DIM).add_modifier(Modifier::BOLD),
+            ),
+        ])),
+        PromptDisplayRow::Item(i) => ListItem::new(app.prompts[*i].name.clone()),
+    }).collect();
     let empty_hint = if !project_active {
         String::new()
     } else {
@@ -5482,6 +5547,7 @@ fn draw_skills(frame: &mut Frame, app: &App) {
     frame.render_widget(
         Paragraph::new(footer(&[
             ("↑↓/jk", "navigate"),
+            ("f", "browse skills.sh"),
             ("esc", "back"),
             ("tab", "switch"),
             ("q", "quit"),
@@ -6684,6 +6750,18 @@ fn draw_sessions(frame: &mut Frame, app: &App) {
 }
 
 fn handle_skills(app: &mut App, key: KeyCode) -> bool {
+    if key == KeyCode::Char('f') {
+        if let Some(idx) = app.active_project_idx {
+            if let Some(project) = app.projects.get(idx) {
+                app.pending_command = Some(ExternalCommand {
+                    program: "npx".to_string(),
+                    args: vec!["skills".to_string(), "find".to_string()],
+                    cwd: project.path.clone(),
+                });
+            }
+        }
+        return false;
+    }
     let len = app.skills.len();
     if len == 0 {
         return false;
@@ -7192,6 +7270,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
             execute!(terminal.backend_mut(), EnterAlternateScreen)?;
             terminal.clear()?;
             app.refresh_setup();
+            app.skills_loaded = false;
             app.pane_message = match result {
                 Ok(status) if status.success() => Some("Tool exited.".to_string()),
                 Ok(status) => Some(format!("Error: exited with status {status}")),
