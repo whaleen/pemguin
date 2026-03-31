@@ -84,8 +84,8 @@ update-tap:
         git clone https://x-access-token:${{ secrets.GH_PAT }}@github.com/whaleen/homebrew-tap.git
         cd homebrew-tap
         sed -i "s/version \".*\"/version \"${VERSION}\"/" Formula/pemguin.rb
-        sed -i "s/sha256 \"[a-f0-9]*\" # aarch64/sha256 \"${ARM_SHA}\" # aarch64/" Formula/pemguin.rb
-        sed -i "s/sha256 \"[a-f0-9]*\" # x86_64/sha256 \"${X86_SHA}\" # x86_64/" Formula/pemguin.rb
+        sed -i "s/sha256 \"[^\"]*\" # aarch64/sha256 \"${ARM_SHA}\" # aarch64/" Formula/pemguin.rb
+        sed -i "s/sha256 \"[^\"]*\" # x86_64/sha256 \"${X86_SHA}\" # x86_64/" Formula/pemguin.rb
         git config user.email "actions@github.com"
         git config user.name "GitHub Actions"
         git add Formula/pemguin.rb
@@ -124,5 +124,7 @@ The `# aarch64` and `# x86_64` comments are required for the sed replacements.
 - `GITHUB_TOKEN` is automatic — do not add it manually
 
 ## Current state
-No release workflow exists yet. No formula exists in the tap yet.
-Both need to be created before the first tag push.
+`.github/workflows/release.yml` exists and is active.
+`Formula/pemguin.rb` exists in `whaleen/homebrew-tap`.
+`GH_PAT` secret is configured in whaleen/pemguin repo settings.
+Pipeline is live — push a tag to trigger a release.

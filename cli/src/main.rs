@@ -324,6 +324,12 @@ struct Skill {
     description: String,
 }
 
+struct RegistrySkill {
+    name: String,
+    source: String,
+    installs: u64,
+}
+
 struct McpServer {
     name: String,
     command: String,
@@ -1351,6 +1357,15 @@ struct App {
     skills: Vec<Skill>,
     skills_list_state: ListState,
     skills_loaded: bool,
+    skills_registry: Vec<RegistrySkill>,
+    skills_registry_loaded: bool,
+    skills_registry_loading: bool,
+    skills_browse: bool,
+    skills_browse_query: String,
+    skills_browse_query_active: bool,
+    skills_browse_list_state: ListState,
+    skills_browse_indices: Vec<usize>,
+    skills_install_message: Option<String>,
     // MCP
     mcp_servers: Vec<McpServer>,
     mcp_list_state: ListState,
@@ -1386,6 +1401,11 @@ enum AsyncResult {
     Projects {
         generation: u64,
         projects: Vec<Project>,
+    },
+    Registry(Vec<RegistrySkill>),
+    SkillInstalled {
+        name: String,
+        result: Result<String, String>,
     },
 }
 
@@ -2283,6 +2303,228 @@ fn load_skills(path: &Path) -> Vec<Skill> {
     skills
 }
 
+fn fetch_skills_registry() -> Vec<RegistrySkill> {
+    let body = match ureq::get("https://skills.sh/")
+        .set("User-Agent", "pemguin/1.0")
+        .call()
+    {
+        Ok(resp) => match resp.into_string() {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        },
+        Err(_) => return vec![],
+    };
+    let marker = "\"initialSkills\":";
+    let start = match body.find(marker) {
+        Some(i) => i + marker.len(),
+        None => return vec![],
+    };
+    let json_str = match extract_json_value(&body[start..]) {
+        Some(s) => s,
+        None => return vec![],
+    };
+    let arr: Vec<serde_json::Value> = match serde_json::from_str(&json_str) {
+        Ok(v) => v,
+        Err(_) => return vec![],
+    };
+    let mut skills: Vec<RegistrySkill> = arr
+        .iter()
+        .filter_map(|v| {
+            Some(RegistrySkill {
+                name: v.get("name")?.as_str()?.to_string(),
+                source: v.get("source")?.as_str()?.to_string(),
+                installs: v.get("installs")?.as_u64().unwrap_or(0),
+            })
+        })
+        .collect();
+    skills.sort_by(|a, b| b.installs.cmp(&a.installs));
+    skills
+}
+
+fn extract_json_value(s: &str) -> Option<String> {
+    let first = s.chars().next()?;
+    let (open, close) = match first {
+        '[' => ('[', ']'),
+        '{' => ('{', '}'),
+        _ => return None,
+    };
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escape = false;
+    for (i, c) in s.char_indices() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        if in_string {
+            if c == '\\' {
+                escape = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        if c == '"' {
+            in_string = true;
+            continue;
+        }
+        if c == open {
+            depth += 1;
+        } else if c == close {
+            depth -= 1;
+            if depth == 0 {
+                return Some(s[..=i].to_string());
+            }
+        }
+    }
+    None
+}
+
+fn filter_registry(registry: &[RegistrySkill], query: &str) -> Vec<usize> {
+    if query.is_empty() {
+        return (0..registry.len()).collect();
+    }
+    let q = query.to_lowercase();
+    registry
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| {
+            s.name.to_lowercase().contains(&q) || s.source.to_lowercase().contains(&q)
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
+fn install_skill(project_path: &Path, source: &str, skill_name: &str) -> Result<String, String> {
+    let tmp = std::env::temp_dir().join(format!("pemguin-skill-{}", skill_name));
+    let _ = fs::remove_dir_all(&tmp);
+    let out = Command::new("git")
+        .args([
+            "clone", "--depth", "1",
+            &format!("https://github.com/{}", source),
+            tmp.to_str().unwrap_or(""),
+        ])
+        .output()
+        .map_err(|e| format!("git clone failed: {e}"))?;
+    if !out.status.success() {
+        let _ = fs::remove_dir_all(&tmp);
+        return Err(format!(
+            "git clone failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let skill_dirs = find_skill_dirs(&tmp);
+    if skill_dirs.is_empty() {
+        let _ = fs::remove_dir_all(&tmp);
+        return Err("No SKILL.md found in repository".to_string());
+    }
+    let (actual_name, skill_src) = skill_dirs
+        .iter()
+        .find(|(n, _)| n == skill_name)
+        .or_else(|| skill_dirs.first())
+        .map(|(n, p)| (n.clone(), p.clone()))
+        .ok_or_else(|| "No matching skill found".to_string())?;
+    let dest = project_path
+        .join(".agents")
+        .join("skills")
+        .join(&actual_name);
+    fs::create_dir_all(&dest).map_err(|e| e.to_string())?;
+    copy_dir_all(&skill_src, &dest).map_err(|e| e.to_string())?;
+    let hash = Command::new("shasum")
+        .args(["-a", "256", dest.join("SKILL.md").to_str().unwrap_or("")])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.split_whitespace().next().map(|s| s.to_string()))
+        .unwrap_or_else(|| "unknown".to_string());
+    update_skills_lock(project_path, &actual_name, source, &hash)?;
+    let _ = fs::remove_dir_all(&tmp);
+    Ok(format!("Installed {}", actual_name))
+}
+
+fn find_skill_dirs(root: &Path) -> Vec<(String, PathBuf)> {
+    let mut result = Vec::new();
+    find_skill_dirs_inner(root, root, &mut result);
+    result
+}
+
+fn find_skill_dirs_inner(root: &Path, dir: &Path, result: &mut Vec<(String, PathBuf)>) {
+    if dir != root && dir.join("SKILL.md").exists() {
+        let name = dir
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        result.push((name, dir.to_path_buf()));
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    for entry in entries.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        if name.starts_with('.') || name == "node_modules" || name == "target" {
+            continue;
+        }
+        find_skill_dirs_inner(root, &path, result);
+    }
+    // If nothing found in subdirs, check if root itself has SKILL.md
+    if result.is_empty() && dir == root && root.join("SKILL.md").exists() {
+        let name = root
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        result.push((name, root.to_path_buf()));
+    }
+}
+
+fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        if src_path.is_dir() {
+            copy_dir_all(&src_path, &dst_path)?;
+        } else {
+            fs::copy(&src_path, &dst_path)?;
+        }
+    }
+    Ok(())
+}
+
+fn update_skills_lock(
+    project_path: &Path,
+    name: &str,
+    source: &str,
+    hash: &str,
+) -> Result<(), String> {
+    let lock_path = project_path.join("skills-lock.json");
+    let mut json: serde_json::Value = if lock_path.exists() {
+        fs::read_to_string(&lock_path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_else(|| serde_json::json!({"version": 1, "skills": {}}))
+    } else {
+        serde_json::json!({"version": 1, "skills": {}})
+    };
+    if let Some(skills) = json.get_mut("skills").and_then(|v| v.as_object_mut()) {
+        skills.insert(
+            name.to_string(),
+            serde_json::json!({
+                "source": source,
+                "sourceType": "github",
+                "computedHash": hash,
+            }),
+        );
+    }
+    let out = serde_json::to_string_pretty(&json).map_err(|e| e.to_string())?;
+    fs::write(&lock_path, out).map_err(|e| e.to_string())
+}
+
 fn load_mcp_servers(path: &Path) -> Vec<McpServer> {
     let mcp_path = path.join(".mcp.json");
     let content = match fs::read_to_string(&mcp_path) {
@@ -2565,6 +2807,15 @@ impl App {
                 s
             },
             skills_loaded: false,
+            skills_registry: vec![],
+            skills_registry_loaded: false,
+            skills_registry_loading: false,
+            skills_browse: false,
+            skills_browse_query: String::new(),
+            skills_browse_query_active: false,
+            skills_browse_list_state: ListState::default(),
+            skills_browse_indices: vec![],
+            skills_install_message: None,
             mcp_servers: vec![],
             mcp_list_state: {
                 let mut s = ListState::default();
@@ -2928,6 +3179,29 @@ impl App {
                         self.projects_msg =
                             Some(format!("{} projects loaded", self.projects.len()));
                     }
+                }
+                AsyncResult::Registry(skills) => {
+                    self.skills_registry = skills;
+                    self.skills_registry_loaded = true;
+                    self.skills_registry_loading = false;
+                    self.skills_browse_indices = (0..self.skills_registry.len()).collect();
+                    let mut ls = ListState::default();
+                    if !self.skills_registry.is_empty() {
+                        ls.select(Some(0));
+                    }
+                    self.skills_browse_list_state = ls;
+                }
+                AsyncResult::SkillInstalled { name, result } => {
+                    match result {
+                        Ok(msg) => {
+                            self.skills_install_message = Some(msg);
+                            self.skills_loaded = false; // trigger reload
+                        }
+                        Err(e) => {
+                            self.skills_install_message = Some(format!("Error: {e}"));
+                        }
+                    }
+                    let _ = name;
                 }
             }
         }
@@ -5458,102 +5732,240 @@ fn draw_memories(frame: &mut Frame, app: &App) {
 
 fn draw_skills(frame: &mut Frame, app: &App) {
     let area = frame.area();
+    let footer_h = if app.skills_browse && app.skills_install_message.is_some() { 3 } else { 1 };
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Min(0),
-            Constraint::Length(1),
+            Constraint::Length(footer_h),
         ])
         .split(area);
 
     frame.render_widget(Paragraph::new(header_row(app)), outer[0]);
     frame.render_widget(Paragraph::new(nav_row(app)), outer[1]);
 
-    let main = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
-        .split(outer[2]);
+    if app.skills_browse {
+        // ── Browse mode ──────────────────────────────────────────────────
+        let browse_h = if app.skills_browse_query_active { 3 } else { 0 };
+        let inner = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(0), Constraint::Length(browse_h)])
+            .split(outer[2]);
 
-    let items: Vec<ListItem> = app
-        .skills
-        .iter()
-        .map(|s| ListItem::new(s.name.clone()))
-        .collect();
+        let main = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+            .split(inner[0]);
 
-    if items.is_empty() {
-        frame.render_widget(
-            Paragraph::new(vec![
-                Line::from(""),
-                Line::from(Span::styled(
-                    "  no skills installed",
-                    Style::default().fg(Color::DarkGray),
-                )),
-                Line::from(""),
-                Line::from(Span::styled(
-                    "  npx skills add <owner/repo> --skill <name> -y",
-                    Style::default().fg(FG_XDIM),
-                )),
-            ])
-            .block(Block::default().borders(Borders::ALL).title(" skills ")),
-            outer[2],
-        );
-    } else {
-        let mut ls = app.skills_list_state.clone();
-        frame.render_stateful_widget(
-            List::new(items)
-                .block(Block::default().borders(Borders::ALL).title(" skills "))
-                .highlight_style(hl())
-                .highlight_symbol("> "),
-            main[0],
-            &mut ls,
-        );
-
-        let preview = app
-            .skills_list_state
-            .selected()
-            .and_then(|i| app.skills.get(i))
-            .map(|s| {
-                let mut lines = vec![
+        if app.skills_registry_loading {
+            frame.render_widget(
+                Paragraph::new(vec![
+                    Line::from(""),
                     Line::from(Span::styled(
-                        s.name.clone(),
-                        Style::default()
-                            .fg(Color::White)
-                            .add_modifier(Modifier::BOLD),
+                        "  fetching skills.sh…",
+                        Style::default().fg(FG_DIM),
+                    )),
+                ])
+                .block(Block::default().borders(Borders::ALL).title(" browse ")),
+                outer[2],
+            );
+        } else {
+            let items: Vec<ListItem> = app
+                .skills_browse_indices
+                .iter()
+                .filter_map(|&i| app.skills_registry.get(i))
+                .map(|s| ListItem::new(s.name.clone()))
+                .collect();
+
+            let title = if app.skills_browse_query.is_empty() {
+                format!(" browse ({}) ", app.skills_browse_indices.len())
+            } else {
+                format!(
+                    " browse — \"{}\" ({}) ",
+                    app.skills_browse_query,
+                    app.skills_browse_indices.len()
+                )
+            };
+
+            let mut ls = app.skills_browse_list_state.clone();
+            frame.render_stateful_widget(
+                List::new(items)
+                    .block(Block::default().borders(Borders::ALL).title(title))
+                    .highlight_style(hl())
+                    .highlight_symbol("> "),
+                main[0],
+                &mut ls,
+            );
+
+            let detail = app
+                .skills_browse_list_state
+                .selected()
+                .and_then(|i| app.skills_browse_indices.get(i))
+                .and_then(|&ri| app.skills_registry.get(ri))
+                .map(|s| {
+                    vec![
+                        Line::from(Span::styled(
+                            s.name.clone(),
+                            Style::default()
+                                .fg(Color::White)
+                                .add_modifier(Modifier::BOLD),
+                        )),
+                        Line::from(""),
+                        Line::from(vec![
+                            Span::styled("source   ", Style::default().fg(FG_DIM)),
+                            Span::raw(s.source.clone()),
+                        ]),
+                        Line::from(vec![
+                            Span::styled("installs ", Style::default().fg(FG_DIM)),
+                            Span::raw(format!("{}", s.installs)),
+                        ]),
+                        Line::from(""),
+                        Line::from(Span::styled(
+                            "press enter to install",
+                            Style::default().fg(FG_XDIM),
+                        )),
+                    ]
+                })
+                .unwrap_or_default();
+
+            frame.render_widget(
+                Paragraph::new(detail)
+                    .block(Block::default().borders(Borders::ALL).title(" detail "))
+                    .wrap(Wrap { trim: false }),
+                main[1],
+            );
+
+            if app.skills_browse_query_active {
+                frame.render_widget(
+                    Paragraph::new(Line::from(vec![
+                        Span::styled("/", Style::default().fg(ACCENT)),
+                        Span::raw(app.skills_browse_query.clone()),
+                        Span::styled("█", Style::default().fg(ACCENT)),
+                    ]))
+                    .block(Block::default().borders(Borders::ALL).title(" search ")),
+                    inner[1],
+                );
+            }
+        }
+
+        if let Some(msg) = &app.skills_install_message {
+            let (icon, color) = if msg.starts_with("Error") {
+                (I_CROSS, C_RED)
+            } else {
+                (I_CHECK, C_GREEN)
+            };
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    format!("  {icon}  {msg}"),
+                    Style::default().fg(color),
+                ))
+                .block(Block::default().borders(Borders::ALL)),
+                outer[3],
+            );
+        } else if app.skills_browse_query_active {
+            frame.render_widget(
+                Paragraph::new(footer(&[("esc", "cancel search"), ("enter", "confirm")])),
+                outer[3],
+            );
+        } else {
+            frame.render_widget(
+                Paragraph::new(footer(&[
+                    ("↑↓/jk", "navigate"),
+                    ("/", "search"),
+                    ("enter", "install"),
+                    ("esc", "installed view"),
+                ])),
+                outer[3],
+            );
+        }
+    } else {
+        // ── Installed view ───────────────────────────────────────────────
+        let main = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
+            .split(outer[2]);
+
+        let items: Vec<ListItem> = app
+            .skills
+            .iter()
+            .map(|s| ListItem::new(s.name.clone()))
+            .collect();
+
+        if items.is_empty() {
+            frame.render_widget(
+                Paragraph::new(vec![
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "  no skills installed",
+                        Style::default().fg(Color::DarkGray),
                     )),
                     Line::from(""),
-                    Line::from(vec![
-                        Span::styled("source  ", Style::default().fg(FG_DIM)),
-                        Span::raw(s.source.clone()),
-                    ]),
-                ];
-                if !s.description.is_empty() {
-                    lines.push(Line::from(""));
-                    lines.push(Line::from(Span::raw(s.description.clone())));
-                }
-                lines
-            })
-            .unwrap_or_default();
+                    Line::from(Span::styled(
+                        "  press b to browse skills.sh",
+                        Style::default().fg(FG_XDIM),
+                    )),
+                ])
+                .block(Block::default().borders(Borders::ALL).title(" skills ")),
+                outer[2],
+            );
+        } else {
+            let mut ls = app.skills_list_state.clone();
+            frame.render_stateful_widget(
+                List::new(items)
+                    .block(Block::default().borders(Borders::ALL).title(" skills "))
+                    .highlight_style(hl())
+                    .highlight_symbol("> "),
+                main[0],
+                &mut ls,
+            );
+
+            let preview = app
+                .skills_list_state
+                .selected()
+                .and_then(|i| app.skills.get(i))
+                .map(|s| {
+                    let mut lines = vec![
+                        Line::from(Span::styled(
+                            s.name.clone(),
+                            Style::default()
+                                .fg(Color::White)
+                                .add_modifier(Modifier::BOLD),
+                        )),
+                        Line::from(""),
+                        Line::from(vec![
+                            Span::styled("source  ", Style::default().fg(FG_DIM)),
+                            Span::raw(s.source.clone()),
+                        ]),
+                    ];
+                    if !s.description.is_empty() {
+                        lines.push(Line::from(""));
+                        lines.push(Line::from(Span::raw(s.description.clone())));
+                    }
+                    lines
+                })
+                .unwrap_or_default();
+
+            frame.render_widget(
+                Paragraph::new(preview)
+                    .block(Block::default().borders(Borders::ALL).title(" detail "))
+                    .wrap(Wrap { trim: false }),
+                main[1],
+            );
+        }
 
         frame.render_widget(
-            Paragraph::new(preview)
-                .block(Block::default().borders(Borders::ALL).title(" detail "))
-                .wrap(Wrap { trim: false }),
-            main[1],
+            Paragraph::new(footer(&[
+                ("↑↓/jk", "navigate"),
+                ("b", "browse skills.sh"),
+                ("esc", "back"),
+                ("tab", "switch"),
+                ("q", "quit"),
+            ])),
+            outer[3],
         );
     }
-
-    frame.render_widget(
-        Paragraph::new(footer(&[
-            ("↑↓/jk", "navigate"),
-            ("f", "browse skills.sh"),
-            ("esc", "back"),
-            ("tab", "switch"),
-            ("q", "quit"),
-        ])),
-        outer[3],
-    );
 }
 
 fn draw_mcp(frame: &mut Frame, app: &App) {
@@ -6750,18 +7162,119 @@ fn draw_sessions(frame: &mut Frame, app: &App) {
 }
 
 fn handle_skills(app: &mut App, key: KeyCode) -> bool {
-    if key == KeyCode::Char('f') {
-        if let Some(idx) = app.active_project_idx {
-            if let Some(project) = app.projects.get(idx) {
-                app.pending_command = Some(ExternalCommand {
-                    program: "npx".to_string(),
-                    args: vec!["skills".to_string(), "find".to_string()],
-                    cwd: project.path.clone(),
-                });
+    if app.skills_browse {
+        // ── Browse mode key handling ──────────────────────────────────────
+        if app.skills_browse_query_active {
+            match key {
+                KeyCode::Esc => {
+                    app.skills_browse_query_active = false;
+                }
+                KeyCode::Enter => {
+                    app.skills_browse_query_active = false;
+                }
+                KeyCode::Backspace => {
+                    app.skills_browse_query.pop();
+                    app.skills_browse_indices =
+                        filter_registry(&app.skills_registry, &app.skills_browse_query);
+                    let mut ls = ListState::default();
+                    if !app.skills_browse_indices.is_empty() {
+                        ls.select(Some(0));
+                    }
+                    app.skills_browse_list_state = ls;
+                }
+                KeyCode::Char(c) => {
+                    app.skills_browse_query.push(c);
+                    app.skills_browse_indices =
+                        filter_registry(&app.skills_registry, &app.skills_browse_query);
+                    let mut ls = ListState::default();
+                    if !app.skills_browse_indices.is_empty() {
+                        ls.select(Some(0));
+                    }
+                    app.skills_browse_list_state = ls;
+                }
+                _ => {}
             }
+            return false;
+        }
+
+        match key {
+            KeyCode::Esc | KeyCode::Char('b') => {
+                app.skills_browse = false;
+                app.skills_browse_query.clear();
+                app.skills_install_message = None;
+            }
+            KeyCode::Char('/') => {
+                app.skills_browse_query_active = true;
+                app.skills_install_message = None;
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let len = app.skills_browse_indices.len();
+                if len > 0 {
+                    let n = (app.skills_browse_list_state.selected().unwrap_or(0) + 1) % len;
+                    app.skills_browse_list_state.select(Some(n));
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                let len = app.skills_browse_indices.len();
+                if len > 0 {
+                    let cur = app.skills_browse_list_state.selected().unwrap_or(0);
+                    let n = if cur == 0 { len - 1 } else { cur - 1 };
+                    app.skills_browse_list_state.select(Some(n));
+                }
+            }
+            KeyCode::Enter => {
+                if let Some(display_idx) = app.skills_browse_list_state.selected() {
+                    if let Some(&registry_idx) = app.skills_browse_indices.get(display_idx) {
+                        if let Some(skill) = app.skills_registry.get(registry_idx) {
+                            if let Some(proj_idx) = app.active_project_idx {
+                                if let Some(project) = app.projects.get(proj_idx) {
+                                    let project_path = project.path.clone();
+                                    let source = skill.source.clone();
+                                    let name = skill.name.clone();
+                                    let tx = app.async_tx.clone();
+                                    app.skills_install_message =
+                                        Some(format!("Installing {}…", name));
+                                    std::thread::spawn(move || {
+                                        let result = install_skill(&project_path, &source, &name);
+                                        let _ = tx.send(AsyncResult::SkillInstalled {
+                                            name,
+                                            result,
+                                        });
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
         return false;
     }
+
+    // ── Installed view key handling ───────────────────────────────────────
+    if key == KeyCode::Char('b') {
+        app.skills_browse = true;
+        app.skills_install_message = None;
+        if !app.skills_registry_loaded && !app.skills_registry_loading {
+            app.skills_registry_loading = true;
+            let tx = app.async_tx.clone();
+            std::thread::spawn(move || {
+                let skills = fetch_skills_registry();
+                let _ = tx.send(AsyncResult::Registry(skills));
+            });
+        } else if app.skills_registry_loaded {
+            app.skills_browse_indices =
+                filter_registry(&app.skills_registry, &app.skills_browse_query);
+            let mut ls = ListState::default();
+            if !app.skills_browse_indices.is_empty() {
+                ls.select(Some(0));
+            }
+            app.skills_browse_list_state = ls;
+        }
+        return false;
+    }
+
     let len = app.skills.len();
     if len == 0 {
         return false;
