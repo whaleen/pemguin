@@ -2303,30 +2303,7 @@ fn load_skills(path: &Path) -> Vec<Skill> {
     skills
 }
 
-fn fetch_skills_registry() -> Vec<RegistrySkill> {
-    let body = match ureq::get("https://skills.sh/")
-        .set("User-Agent", "pemguin/1.0")
-        .call()
-    {
-        Ok(resp) => match resp.into_string() {
-            Ok(s) => s,
-            Err(_) => return vec![],
-        },
-        Err(_) => return vec![],
-    };
-    let marker = "\"initialSkills\":";
-    let start = match body.find(marker) {
-        Some(i) => i + marker.len(),
-        None => return vec![],
-    };
-    let json_str = match extract_json_value(&body[start..]) {
-        Some(s) => s,
-        None => return vec![],
-    };
-    let arr: Vec<serde_json::Value> = match serde_json::from_str(&json_str) {
-        Ok(v) => v,
-        Err(_) => return vec![],
-    };
+fn parse_registry_skills(arr: Vec<serde_json::Value>) -> Vec<RegistrySkill> {
     let mut skills: Vec<RegistrySkill> = arr
         .iter()
         .filter_map(|v| {
@@ -2339,6 +2316,71 @@ fn fetch_skills_registry() -> Vec<RegistrySkill> {
         .collect();
     skills.sort_by(|a, b| b.installs.cmp(&a.installs));
     skills
+}
+
+fn fetch_skills_registry() -> Vec<RegistrySkill> {
+    let body = match ureq::get("https://skills.sh/")
+        .set("User-Agent", "pemguin/1.0")
+        .call()
+    {
+        Ok(resp) => match resp.into_string() {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        },
+        Err(_) => return vec![],
+    };
+
+    // Try plain JSON form first: "initialSkills":[...]
+    let plain = "\"initialSkills\":";
+    if let Some(start) = body.find(plain) {
+        if let Some(json_str) = extract_json_value(&body[start + plain.len()..]) {
+            if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&json_str) {
+                return parse_registry_skills(arr);
+            }
+        }
+    }
+
+    // Try RSC escaped form: \"initialSkills\":
+    let escaped = "\\\"initialSkills\\\":";
+    if let Some(start) = body.find(escaped) {
+        let slice = &body[start + escaped.len()..];
+        // Find opening '[' within a short window
+        if let Some(bracket) = slice[..slice.len().min(10)].find('[') {
+            if let Some(raw) = extract_escaped_json_array(&slice[bracket..]) {
+                let unescaped = raw.replace("\\\"", "\"").replace("\\\\", "\\");
+                if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&unescaped) {
+                    return parse_registry_skills(arr);
+                }
+            }
+        }
+    }
+
+    vec![]
+}
+
+// Extracts a JSON array from RSC-escaped content where all " are written as \"
+fn extract_escaped_json_array(s: &str) -> Option<String> {
+    let mut depth = 0i32;
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+            i += 2; // skip escape sequence
+            continue;
+        }
+        match bytes[i] {
+            b'[' => depth += 1,
+            b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(s[..=i].to_string());
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 fn extract_json_value(s: &str) -> Option<String> {
@@ -7198,7 +7240,15 @@ fn handle_skills(app: &mut App, key: KeyCode) -> bool {
         }
 
         match key {
-            KeyCode::Esc | KeyCode::Char('b') => {
+            KeyCode::Esc => {
+                if app.skills_install_message.is_some() {
+                    app.skills_install_message = None;
+                } else {
+                    app.skills_browse = false;
+                    app.skills_browse_query.clear();
+                }
+            }
+            KeyCode::Char('b') => {
                 app.skills_browse = false;
                 app.skills_browse_query.clear();
                 app.skills_install_message = None;
