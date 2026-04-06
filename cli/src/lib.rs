@@ -19,7 +19,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, List, ListItem, ListState, Paragraph, Row, Table, TableState, Wrap},
+    widgets::{Block, BorderType, Borders, Cell, List, ListItem, ListState, Paragraph, Row, Table, TableState, Wrap},
 };
 use regex::Regex;
 
@@ -4040,7 +4040,7 @@ fn draw_home(frame: &mut Frame, app: &App) {
     frame.render_widget(Paragraph::new(nav_row(app)), outer[1]);
 
     let title = format!(" {} ", app.repo);
-    let block = Block::default().borders(Borders::ALL).title(title);
+    let block = Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(title);
 
     if let Some(data) = &app.home_data {
         let inner = block.inner(outer[2]);
@@ -4356,7 +4356,7 @@ fn draw_home(frame: &mut Frame, app: &App) {
             ]))
             .block(
                 Block::default()
-                    .borders(Borders::ALL)
+                    .borders(Borders::ALL).border_type(BorderType::Rounded)
                     .title(format!(" edit {label} ")),
             ),
             outer[3],
@@ -4372,7 +4372,7 @@ fn draw_home(frame: &mut Frame, app: &App) {
                 format!("  {icon}  {msg}"),
                 Style::default().fg(color),
             ))
-            .block(Block::default().borders(Borders::ALL)),
+            .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)),
             outer[3],
         );
     }
@@ -4506,7 +4506,7 @@ fn draw_prompts(frame: &mut Frame, app: &App) {
     };
     frame.render_stateful_widget(
         List::new(items)
-            .block(Block::default().borders(Borders::ALL).title(block_title))
+            .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(block_title))
             .highlight_style(hl())
             .highlight_symbol("> "),
         list_split[1],
@@ -4520,7 +4520,7 @@ fn draw_prompts(frame: &mut Frame, app: &App) {
         .unwrap_or("");
     frame.render_widget(
         Paragraph::new(preview)
-            .block(Block::default().borders(Borders::ALL).title(" preview "))
+            .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" preview "))
             .wrap(Wrap { trim: false }),
         left_area[1],
     );
@@ -4533,7 +4533,7 @@ fn draw_prompts(frame: &mut Frame, app: &App) {
             ]))
             .block(
                 Block::default()
-                    .borders(Borders::ALL)
+                    .borders(Borders::ALL).border_type(BorderType::Rounded)
                     .title(" new prompt name "),
             ),
             outer[3],
@@ -4546,7 +4546,7 @@ fn draw_prompts(frame: &mut Frame, app: &App) {
         };
         frame.render_widget(
             Paragraph::new(Span::styled(format!("  {msg}"), Style::default().fg(color)))
-                .block(Block::default().borders(Borders::ALL)),
+                .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)),
             outer[3],
         );
     } else {
@@ -4591,7 +4591,7 @@ fn draw_issues(frame: &mut Frame, app: &App) {
                     Style::default().fg(theme().red),
                 )),
             ])
-            .block(Block::default().borders(Borders::ALL).title(" issues ")),
+            .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" issues ")),
             outer[2],
         );
     } else if app.issues_loading {
@@ -4603,7 +4603,7 @@ fn draw_issues(frame: &mut Frame, app: &App) {
                     Style::default().fg(theme().fg_xdim),
                 )),
             ])
-            .block(Block::default().borders(Borders::ALL).title(" issues ")),
+            .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" issues ")),
             outer[2],
         );
     } else if app.issues.is_empty() {
@@ -4615,7 +4615,7 @@ fn draw_issues(frame: &mut Frame, app: &App) {
                     Style::default().fg(Color::DarkGray),
                 )),
             ])
-            .block(Block::default().borders(Borders::ALL).title(" issues ")),
+            .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" issues ")),
             outer[2],
         );
     } else {
@@ -4646,7 +4646,7 @@ fn draw_issues(frame: &mut Frame, app: &App) {
             List::new(items)
                 .block(
                     Block::default()
-                        .borders(Borders::ALL)
+                        .borders(Borders::ALL).border_type(BorderType::Rounded)
                         .title(" open issues "),
                 )
                 .highlight_style(hl())
@@ -4685,7 +4685,7 @@ fn draw_issues(frame: &mut Frame, app: &App) {
 
         frame.render_widget(
             Paragraph::new(preview)
-                .block(Block::default().borders(Borders::ALL).title(" body "))
+                .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" body "))
                 .wrap(Wrap { trim: false }),
             main[1],
         );
@@ -4730,7 +4730,7 @@ fn draw_projects(frame: &mut Frame, app: &App) {
                     Style::default().fg(Color::DarkGray),
                 )),
             ])
-            .block(Block::default().borders(Borders::ALL).title(" projects ")),
+            .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" projects ")),
             outer[1],
         );
     } else if app.projects.is_empty() {
@@ -4747,7 +4747,7 @@ fn draw_projects(frame: &mut Frame, app: &App) {
                     Style::default().fg(Color::DarkGray),
                 )),
             ])
-            .block(Block::default().borders(Borders::ALL).title(" projects ")),
+            .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" projects ")),
             outer[1],
         );
     } else {
@@ -4903,7 +4903,7 @@ fn draw_projects(frame: &mut Frame, app: &App) {
         frame.render_stateful_widget(
             Table::new(rows, widths)
                 .header(header)
-                .block(Block::default().borders(Borders::ALL).title(" projects "))
+                .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" projects "))
                 .row_highlight_style(hl())
                 .highlight_symbol("> ")
                 .column_spacing(2),
@@ -5364,7 +5364,7 @@ fn draw_setup(frame: &mut Frame, app: &App) {
                     Style::default().fg(Color::DarkGray),
                 )),
             ])
-            .block(Block::default().borders(Borders::ALL).title(" config ")),
+            .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" config ")),
             outer[2],
         );
     } else if app.setup_items.is_empty() {
@@ -5373,7 +5373,7 @@ fn draw_setup(frame: &mut Frame, app: &App) {
                 "  Scanning…",
                 Style::default().fg(Color::DarkGray),
             ))
-            .block(Block::default().borders(Borders::ALL).title(" config ")),
+            .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" config ")),
             outer[2],
         );
     } else if let Some(editor) = &app.setup_toml_editor {
@@ -5429,7 +5429,7 @@ fn draw_setup(frame: &mut Frame, app: &App) {
         ls.select(focused_row_idx);
         frame.render_stateful_widget(
             List::new(items)
-                .block(Block::default().borders(Borders::ALL).title(" .pemguin.toml "))
+                .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" .pemguin.toml "))
                 .highlight_style(hl())
                 .highlight_symbol("> "),
             inner[0],
@@ -5446,7 +5446,7 @@ fn draw_setup(frame: &mut Frame, app: &App) {
                 Span::raw("")
             };
             frame.render_widget(
-                Paragraph::new(content).block(Block::default().borders(Borders::ALL)),
+                Paragraph::new(content).block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)),
                 inner[1],
             );
         }
@@ -5510,7 +5510,7 @@ fn draw_setup(frame: &mut Frame, app: &App) {
         let mut ls = app.setup_list_state.clone();
         frame.render_stateful_widget(
             List::new(items)
-                .block(Block::default().borders(Borders::ALL).title(" config "))
+                .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" config "))
                 .highlight_style(hl())
                 .highlight_symbol("> "),
             inner[1],
@@ -5535,7 +5535,7 @@ fn draw_setup(frame: &mut Frame, app: &App) {
                     ),
                     Style::default().fg(color),
                 ))
-                .block(Block::default().borders(Borders::ALL)),
+                .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)),
                 inner[2],
             );
         }
@@ -5663,7 +5663,7 @@ fn draw_memories(frame: &mut Frame, app: &App) {
     let mut ls = app.memory_list_state.clone();
     frame.render_stateful_widget(
         List::new(items)
-            .block(Block::default().borders(Borders::ALL).title(dir_label))
+            .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(dir_label))
             .highlight_style(hl())
             .highlight_symbol("> "),
         left_split[1],
@@ -5679,7 +5679,7 @@ fn draw_memories(frame: &mut Frame, app: &App) {
         .unwrap_or("");
     frame.render_widget(
         Paragraph::new(preview)
-            .block(Block::default().borders(Borders::ALL).title(" preview "))
+            .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" preview "))
             .wrap(Wrap { trim: false }),
         main[1],
     );
@@ -5694,7 +5694,7 @@ fn draw_memories(frame: &mut Frame, app: &App) {
             ]))
             .block(
                 Block::default()
-                    .borders(Borders::ALL)
+                    .borders(Borders::ALL).border_type(BorderType::Rounded)
                     .title(" new memory name "),
             ),
             outer[3],
@@ -5710,7 +5710,7 @@ fn draw_memories(frame: &mut Frame, app: &App) {
                 format!("  {icon}  {msg}"),
                 Style::default().fg(color),
             ))
-            .block(Block::default().borders(Borders::ALL)),
+            .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)),
             outer[3],
         );
     }
@@ -5781,7 +5781,7 @@ fn draw_skills(frame: &mut Frame, app: &App) {
                         Style::default().fg(theme().fg_dim),
                     )),
                 ])
-                .block(Block::default().borders(Borders::ALL).title(" browse ")),
+                .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" browse ")),
                 outer[2],
             );
         } else {
@@ -5805,7 +5805,7 @@ fn draw_skills(frame: &mut Frame, app: &App) {
             let mut ls = app.skills_browse_list_state.clone();
             frame.render_stateful_widget(
                 List::new(items)
-                    .block(Block::default().borders(Borders::ALL).title(title))
+                    .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(title))
                     .highlight_style(hl())
                     .highlight_symbol("> "),
                 main[0],
@@ -5845,7 +5845,7 @@ fn draw_skills(frame: &mut Frame, app: &App) {
 
             frame.render_widget(
                 Paragraph::new(detail)
-                    .block(Block::default().borders(Borders::ALL).title(" detail "))
+                    .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" detail "))
                     .wrap(Wrap { trim: false }),
                 main[1],
             );
@@ -5857,7 +5857,7 @@ fn draw_skills(frame: &mut Frame, app: &App) {
                         Span::raw(app.skills_browse_query.clone()),
                         Span::styled("█", Style::default().fg(theme().accent)),
                     ]))
-                    .block(Block::default().borders(Borders::ALL).title(" search ")),
+                    .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" search ")),
                     inner[1],
                 );
             }
@@ -5874,7 +5874,7 @@ fn draw_skills(frame: &mut Frame, app: &App) {
                     format!("  {icon}  {msg}"),
                     Style::default().fg(color),
                 ))
-                .block(Block::default().borders(Borders::ALL)),
+                .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)),
                 outer[3],
             );
         } else if app.skills_browse_query_active {
@@ -5920,14 +5920,14 @@ fn draw_skills(frame: &mut Frame, app: &App) {
                         Style::default().fg(theme().fg_xdim),
                     )),
                 ])
-                .block(Block::default().borders(Borders::ALL).title(" skills ")),
+                .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" skills ")),
                 outer[2],
             );
         } else {
             let mut ls = app.skills_list_state.clone();
             frame.render_stateful_widget(
                 List::new(items)
-                    .block(Block::default().borders(Borders::ALL).title(" skills "))
+                    .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" skills "))
                     .highlight_style(hl())
                     .highlight_symbol("> "),
                 main[0],
@@ -5962,7 +5962,7 @@ fn draw_skills(frame: &mut Frame, app: &App) {
 
             frame.render_widget(
                 Paragraph::new(preview)
-                    .block(Block::default().borders(Borders::ALL).title(" detail "))
+                    .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" detail "))
                     .wrap(Wrap { trim: false }),
                 main[1],
             );
@@ -6018,7 +6018,7 @@ fn draw_mcp(frame: &mut Frame, app: &App) {
             ])
             .block(
                 Block::default()
-                    .borders(Borders::ALL)
+                    .borders(Borders::ALL).border_type(BorderType::Rounded)
                     .title(" mcp servers "),
             ),
             outer[2],
@@ -6029,7 +6029,7 @@ fn draw_mcp(frame: &mut Frame, app: &App) {
             List::new(items)
                 .block(
                     Block::default()
-                        .borders(Borders::ALL)
+                        .borders(Borders::ALL).border_type(BorderType::Rounded)
                         .title(" mcp servers "),
                 )
                 .highlight_style(hl())
@@ -6066,7 +6066,7 @@ fn draw_mcp(frame: &mut Frame, app: &App) {
 
         frame.render_widget(
             Paragraph::new(preview)
-                .block(Block::default().borders(Borders::ALL).title(" detail "))
+                .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" detail "))
                 .wrap(Wrap { trim: false }),
             main[1],
         );
@@ -6108,7 +6108,7 @@ fn draw_pane(frame: &mut Frame, app: &App) {
     let mut ls = app.pane_list_state.clone();
     frame.render_stateful_widget(
         List::new(items)
-            .block(Block::default().borders(Borders::ALL).title(" tools "))
+            .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" tools "))
             .highlight_style(hl())
             .highlight_symbol("> "),
         main[0],
@@ -6127,7 +6127,7 @@ fn draw_pane(frame: &mut Frame, app: &App) {
         ]),
     ];
     frame.render_widget(
-        Paragraph::new(detail).block(Block::default().borders(Borders::ALL).title(" detail ")),
+        Paragraph::new(detail).block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" detail ")),
         main[1],
     );
     if let Some(msg) = &app.pane_message {
@@ -6138,7 +6138,7 @@ fn draw_pane(frame: &mut Frame, app: &App) {
         };
         frame.render_widget(
             Paragraph::new(Span::styled(format!("  {msg}"), Style::default().fg(color)))
-                .block(Block::default().borders(Borders::ALL)),
+                .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)),
             outer[3],
         );
     }
@@ -6959,7 +6959,7 @@ fn draw_sessions(frame: &mut Frame, app: &App) {
             .collect();
         frame.render_widget(
             Paragraph::new(visible)
-                .block(Block::default().borders(Borders::ALL).title(" summary "))
+                .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" summary "))
                 .wrap(Wrap { trim: false }),
             outer[2],
         );
@@ -7064,7 +7064,7 @@ fn draw_sessions(frame: &mut Frame, app: &App) {
 
         frame.render_widget(
             Paragraph::new(content)
-                .block(Block::default().borders(Borders::ALL).title(" new session ")),
+                .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" new session ")),
             outer[2],
         );
     } else if app.sessions.is_empty() {
@@ -7076,7 +7076,7 @@ fn draw_sessions(frame: &mut Frame, app: &App) {
         ];
         frame.render_widget(
             Paragraph::new(content)
-                .block(Block::default().borders(Borders::ALL).title(" sessions ")),
+                .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" sessions ")),
             outer[2],
         );
     } else {
@@ -7107,7 +7107,7 @@ fn draw_sessions(frame: &mut Frame, app: &App) {
         let mut ls = app.sessions_list_state.clone();
         frame.render_stateful_widget(
             List::new(items)
-                .block(Block::default().borders(Borders::ALL).title(" sessions "))
+                .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" sessions "))
                 .highlight_style(hl())
                 .highlight_symbol("> "),
             main[0],
@@ -7161,7 +7161,7 @@ fn draw_sessions(frame: &mut Frame, app: &App) {
 
         frame.render_widget(
             Paragraph::new(detail)
-                .block(Block::default().borders(Borders::ALL))
+                .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded))
                 .wrap(Wrap { trim: true }),
             main[1],
         );
@@ -7564,7 +7564,7 @@ fn draw_text_editor(frame: &mut Frame, editor: &TextEditorState) {
     }
     frame.render_widget(
         Paragraph::new(lines)
-            .block(Block::default().borders(Borders::ALL).title(" editor "))
+            .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" editor "))
             .wrap(Wrap { trim: false }),
         outer[1],
     );
@@ -7677,7 +7677,7 @@ fn draw_fill(
         }
     }
     frame.render_widget(
-        Paragraph::new(lines).block(Block::default().borders(Borders::ALL)),
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)),
         outer[1],
     );
     frame.render_widget(
@@ -7718,7 +7718,7 @@ fn draw_done(frame: &mut Frame, text: &str) {
         Style::default().fg(Color::DarkGray),
     )));
     frame.render_widget(
-        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" pemguin ")),
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" pemguin ")),
         area,
     );
 }
@@ -7728,7 +7728,7 @@ fn draw_delete_confirm(frame: &mut Frame, confirm: &DeleteConfirm) {
     let popup = centered_rect(62, 9, area);
     frame.render_widget(
         Block::default()
-            .borders(Borders::ALL)
+            .borders(Borders::ALL).border_type(BorderType::Rounded)
             .title(" confirm delete ")
             .style(Style::default().bg(Color::Black)),
         popup,
