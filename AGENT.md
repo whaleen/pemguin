@@ -2,7 +2,7 @@
 
 ## What This Project Is
 
-pemguin (`pm`) is a terminal project manager TUI built with Ratatui. It gives developers a single place to navigate all their local git repos — viewing GitHub issues, checking project setup status, browsing prompts and memory files, and inspecting installed skills and MCP servers. It is agent-agnostic: designed for any AI-assisted dev workflow, not tied to a specific tool.
+pemguin (`pm` / `pemguin`) is a terminal project manager TUI built with Ratatui. It gives developers a single place to navigate all their local git repos — viewing GitHub issues, checking project setup status, browsing prompts and memory files, and inspecting installed skills and MCP servers. It is agent-agnostic: designed for any AI-assisted dev workflow, not tied to a specific tool.
 
 ## Stack
 
@@ -17,7 +17,7 @@ pemguin (`pm`) is a terminal project manager TUI built with Ratatui. It gives de
 ```bash
 cd cli
 cargo run                 # dev build
-cargo install --path .    # install to ~/.cargo/bin/pm
+cargo install --path .    # install to ~/.cargo/bin/{pm,pemguin}
 ```
 
 Prerequisites: Rust stable, `gh` CLI authenticated, Nerd Font terminal. `chafa` is optional (org avatar rendering).

@@ -4,7 +4,7 @@ Terminal project manager for developers who live in the CLI.
 
 ## What it does
 
-`pm` is a Ratatui TUI that keeps your dev projects organized. For each project it surfaces config status, GitHub issues, prompts, memory files, skills, MCP servers, and project tools — all without leaving the terminal.
+`pm` / `pemguin` is a Ratatui TUI that keeps your dev projects organized. For each project it surfaces config status, GitHub issues, prompts, memory files, skills, MCP servers, and project tools — all without leaving the terminal.
 
 Startup scanning and GitHub-backed project data load in the background, so the UI stays responsive while data hydrates.
 
@@ -16,12 +16,15 @@ cd pemguin/cli
 cargo install --path .
 ```
 
+This installs both `pm` and `pemguin`.
+
 Requires: Rust stable, `gh` CLI (authenticated), Nerd Font terminal.
 
 ## Usage
 
 ```bash
 pm
+pemguin
 ```
 
 Navigate with `↑↓` or `jk`. Press `enter` to open a project. `esc` goes back. `q` quits.
