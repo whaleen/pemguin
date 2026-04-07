@@ -3,7 +3,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::OnceLock;
+use std::time::SystemTime;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
 
@@ -27,21 +27,25 @@ use regex::Regex;
 
 #[derive(Clone, serde::Deserialize)]
 struct ThemeConfig {
-    #[serde(default = "default_accent")]  accent: String,
-    #[serde(default = "default_sel_fg")]  sel_fg: String,
-    #[serde(default = "default_fg_dim")]  fg_dim: String,
+    #[serde(default = "default_accent")]  accent:  String,
+    #[serde(default = "default_sel_fg")]  sel_fg:  String,
+    #[serde(default = "default_fg_dim")]  fg_dim:  String,
     #[serde(default = "default_fg_xdim")] fg_xdim: String,
-    #[serde(default = "default_green")]   green: String,
-    #[serde(default = "default_red")]     red: String,
-    #[serde(default = "default_yellow")]  yellow: String,
-    #[serde(default = "default_purple")]  purple: String,
+    #[serde(default = "default_border")]  border:  String,
+    #[serde(default = "default_surface")] surface: String,
+    #[serde(default = "default_green")]   green:   String,
+    #[serde(default = "default_red")]     red:     String,
+    #[serde(default = "default_yellow")]  yellow:  String,
+    #[serde(default = "default_purple")]  purple:  String,
 }
 
-fn default_accent()  -> String { "#C3A6FF".into() }
+fn default_accent()  -> String { "#e8b887".into() }
 fn default_sel_fg()  -> String { "#101010".into() }
 fn default_fg_dim()  -> String { "#A0A0A0".into() }
-fn default_fg_xdim() -> String { "#505050".into() }
-fn default_green()   -> String { "#99FFE4".into() }
+fn default_fg_xdim() -> String { "#7E7E7E".into() }
+fn default_border()  -> String { "#232323".into() }
+fn default_surface() -> String { "#1C1C1C".into() }
+fn default_green()   -> String { "#90b99f".into() }
 fn default_red()     -> String { "#f5a191".into() }
 fn default_yellow()  -> String { "#e6b99d".into() }
 fn default_purple()  -> String { "#aca1cf".into() }
@@ -53,6 +57,8 @@ impl Default for ThemeConfig {
             sel_fg:  default_sel_fg(),
             fg_dim:  default_fg_dim(),
             fg_xdim: default_fg_xdim(),
+            border:  default_border(),
+            surface: default_surface(),
             green:   default_green(),
             red:     default_red(),
             yellow:  default_yellow(),
@@ -61,8 +67,10 @@ impl Default for ThemeConfig {
     }
 }
 
+#[derive(Clone, Copy)]
 struct Theme {
     accent: Color, sel_fg: Color, fg_dim: Color, fg_xdim: Color,
+    border: Color, surface: Color,
     green: Color, red: Color, yellow: Color, purple: Color,
 }
 
@@ -74,23 +82,42 @@ fn hex_color(hex: &str) -> Color {
     Color::Rgb(r, g, b)
 }
 
-static THEME: OnceLock<Theme> = OnceLock::new();
-
-fn theme() -> &'static Theme {
-    THEME.get().expect("theme not initialized")
+thread_local! {
+    static THEME: std::cell::Cell<Option<Theme>> = std::cell::Cell::new(None);
 }
 
-fn init_theme(cfg: &ThemeConfig) {
-    THEME.get_or_init(|| Theme {
+fn theme() -> Theme {
+    THEME.with(|c| c.get().expect("theme not initialized"))
+}
+
+fn set_theme(cfg: &ThemeConfig) {
+    let t = Theme {
         accent:  hex_color(&cfg.accent),
         sel_fg:  hex_color(&cfg.sel_fg),
         fg_dim:  hex_color(&cfg.fg_dim),
         fg_xdim: hex_color(&cfg.fg_xdim),
+        border:  hex_color(&cfg.border),
+        surface: hex_color(&cfg.surface),
         green:   hex_color(&cfg.green),
         red:     hex_color(&cfg.red),
         yellow:  hex_color(&cfg.yellow),
         purple:  hex_color(&cfg.purple),
-    });
+    };
+    THEME.with(|c| c.set(Some(t)));
+}
+
+fn reload_pemguin_theme_if_changed(mtime: &mut Option<SystemTime>) {
+    let Some(path) = dirs_home().map(|h| h.join(".pemguin.toml")) else { return };
+    let Ok(meta) = fs::metadata(&path) else { return };
+    let Ok(modified) = meta.modified() else { return };
+    if mtime.map_or(true, |last| modified > last) {
+        *mtime = Some(modified);
+        if let Ok(s) = fs::read_to_string(&path) {
+            if let Ok(cfg) = toml::from_str::<Config>(&s) {
+                set_theme(&cfg.theme);
+            }
+        }
+    }
 }
 
 // ── Icons (Nerd Fonts) ────────────────────────────────────────────────────────
@@ -1442,6 +1469,7 @@ struct App {
     repo: String,
     async_tx: Sender<AsyncResult>,
     async_rx: Receiver<AsyncResult>,
+    theme_mtime: Option<SystemTime>,
 }
 
 enum AsyncResult {
@@ -2847,6 +2875,7 @@ impl App {
             repo: String::new(),
             async_tx,
             async_rx,
+            theme_mtime: None,
         };
         app.start_projects_scan(false);
         app
@@ -4137,7 +4166,7 @@ fn draw_home(frame: &mut Frame, app: &App) {
         if let Some(desc) = &data.gh_description {
             left.push(Line::from(vec![
                 Span::styled("  desc     ", Style::default().fg(theme().fg_dim)),
-                Span::styled(desc.clone(), Style::default().fg(Color::White)),
+                Span::styled(desc.clone(), Style::default().fg(theme().fg_dim)),
             ]));
         } else if app.home_loading {
             left.push(Line::from(vec![
@@ -7771,7 +7800,7 @@ fn draw_delete_confirm(frame: &mut Frame, confirm: &DeleteConfirm) {
 
 pub fn start() -> io::Result<()> {
     let config = load_config();
-    init_theme(&config.theme);
+    set_theme(&config.theme);
     let mut app = App::new(config);
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -7787,6 +7816,7 @@ pub fn start() -> io::Result<()> {
 
 fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> io::Result<()> {
     loop {
+        reload_pemguin_theme_if_changed(&mut app.theme_mtime);
         app.process_async_results();
         terminal.draw(|f| draw(f, app))?;
 

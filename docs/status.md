@@ -18,7 +18,7 @@ Everything in SPEC.md marked ✅ is shipped. The core loop works end to end:
 
 - **`gh` dependency**: most features silently degrade without a working `gh` auth. No clear error state shown in the UI when `gh` is unavailable.
 - **Nerd Font hard requirement**: no graceful fallback for terminals without Nerd Font support.
-- **Single source file**: `cli/src/main.rs` is ~5500+ lines. Navigation is fine but it will become hard to maintain as features are added.
+- **Single source file**: `cli/src/lib.rs` is ~7800 lines. Navigation is fine but it will become hard to maintain as features are added.
 - **Codex session scan performance**: the Sessions tab does a full walk of `~/.codex/sessions/YYYY/MM/DD/` on every open. For large Codex histories this can be slow. Future fix: cache last-scanned state and do incremental updates.
 - **Project selection on rescan resets**: a full background rescan rebuilds the list state and does not yet preserve the previous selection.
 - **Config reset is blunt**: reset rewrites pemguin-managed sample content, but does not yet show a confirmation step.

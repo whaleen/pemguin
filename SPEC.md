@@ -129,7 +129,7 @@ Feature source of truth. Update this when features ship, change, or get cut.
 - ✅ Nerd Font icons throughout
 - ✅ Sidebar hidden below 70 col
 - 📋 Mouse support
-- 📋 Configurable color theme
+- ✅ Configurable color theme (hot-reload via `~/.pemguin.toml [theme]`, ~50ms detection)
 
 ## Configuration
 

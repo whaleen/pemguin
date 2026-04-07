@@ -59,9 +59,23 @@ Navigate with `↑↓` or `jk`. Press `enter` to open a project. `esc` goes back
 ```toml
 [projects]
 root = "~/Projects"   # directory to scan (2 levels deep for .git)
+
+[theme]
+accent  = "#e8b887"   # hot-reloaded on file change — no restart needed
+sel_fg  = "#101010"
+fg_dim  = "#A0A0A0"
+fg_xdim = "#7E7E7E"
+border  = "#232323"
+surface = "#1C1C1C"
+green   = "#90b99f"
+red     = "#f5a191"
+yellow  = "#e6b99d"
+purple  = "#aca1cf"
 ```
 
-Or set `PEMGUIN_PROJECTS_DIR` env var.
+Or set `PEMGUIN_PROJECTS_DIR` env var for projects root.
+
+Theme changes are detected within ~50ms. If using the whaleen dotfiles, run `theme/generate.sh` to propagate palette changes to all tools including pemguin.
 
 ## Project structure
 
