@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
-use std::io;
+use std::hash::{Hash, Hasher};
+use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::SystemTime;
@@ -23,6 +24,54 @@ use ratatui::{
 };
 use regex::Regex;
 
+#[derive(serde::Serialize)]
+struct CliProjectInspect {
+    project_path: String,
+    repo_root: bool,
+    recommended_ok: usize,
+    recommended_total: usize,
+    setup_complete: bool,
+    project_files: Vec<CliManagedPath>,
+    items: Vec<CliSetupItem>,
+    next_actions: Vec<String>,
+}
+
+#[derive(serde::Serialize)]
+struct CliManagedPath {
+    path: String,
+    kind: &'static str,
+    required: bool,
+}
+
+#[derive(serde::Serialize)]
+struct CliSetupItem {
+    id: String,
+    label: String,
+    detail: String,
+    category: &'static str,
+    status: &'static str,
+    required: bool,
+    optional: bool,
+    gitignore_path: Option<String>,
+    gitignored: bool,
+    edit_path: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct CliAgentInstructions {
+    project_path: String,
+    summary: String,
+    inspect_command: String,
+    notes: Vec<String>,
+}
+
+struct McpToolDef {
+    name: &'static str,
+    title: &'static str,
+    description: &'static str,
+    input_schema: serde_json::Value,
+}
+
 // ── Theme ─────────────────────────────────────────────────────────────────────
 
 #[derive(Clone, serde::Deserialize)]
@@ -31,8 +80,6 @@ struct ThemeConfig {
     #[serde(default = "default_sel_fg")]  sel_fg:  String,
     #[serde(default = "default_fg_dim")]  fg_dim:  String,
     #[serde(default = "default_fg_xdim")] fg_xdim: String,
-    #[serde(default = "default_border")]  border:  String,
-    #[serde(default = "default_surface")] surface: String,
     #[serde(default = "default_green")]   green:   String,
     #[serde(default = "default_red")]     red:     String,
     #[serde(default = "default_yellow")]  yellow:  String,
@@ -43,8 +90,6 @@ fn default_accent()  -> String { "#e8b887".into() }
 fn default_sel_fg()  -> String { "#101010".into() }
 fn default_fg_dim()  -> String { "#A0A0A0".into() }
 fn default_fg_xdim() -> String { "#7E7E7E".into() }
-fn default_border()  -> String { "#232323".into() }
-fn default_surface() -> String { "#1C1C1C".into() }
 fn default_green()   -> String { "#90b99f".into() }
 fn default_red()     -> String { "#f5a191".into() }
 fn default_yellow()  -> String { "#e6b99d".into() }
@@ -57,8 +102,6 @@ impl Default for ThemeConfig {
             sel_fg:  default_sel_fg(),
             fg_dim:  default_fg_dim(),
             fg_xdim: default_fg_xdim(),
-            border:  default_border(),
-            surface: default_surface(),
             green:   default_green(),
             red:     default_red(),
             yellow:  default_yellow(),
@@ -70,7 +113,6 @@ impl Default for ThemeConfig {
 #[derive(Clone, Copy)]
 struct Theme {
     accent: Color, sel_fg: Color, fg_dim: Color, fg_xdim: Color,
-    border: Color, surface: Color,
     green: Color, red: Color, yellow: Color, purple: Color,
 }
 
@@ -96,8 +138,6 @@ fn set_theme(cfg: &ThemeConfig) {
         sel_fg:  hex_color(&cfg.sel_fg),
         fg_dim:  hex_color(&cfg.fg_dim),
         fg_xdim: hex_color(&cfg.fg_xdim),
-        border:  hex_color(&cfg.border),
-        surface: hex_color(&cfg.surface),
         green:   hex_color(&cfg.green),
         red:     hex_color(&cfg.red),
         yellow:  hex_color(&cfg.yellow),
@@ -133,13 +173,10 @@ const I_SETUP: &str = "\u{f013}"; // cog
 const I_PROMPTS: &str = "\u{f0ae}"; // list
 const I_PROJECTS: &str = "\u{f07b}"; // folder
 const I_MEMORY: &str = "\u{f0eb}"; // lightbulb (memories)
-const I_SKILLS: &str = "\u{f0ad}"; // wrench
 const I_MCP: &str = "\u{f0c1}"; // link/chain
 const I_PANE: &str = "\u{f120}"; // >_ terminal prompt
-const I_SESSIONS: &str = "\u{f017}"; // clock
 
-const GITIGNORE_BLOCK: &str = "\n# Pemguin TUI\n.agents/\n.claude/\n.vite-hooks/\nskills-lock.json\nCLAUDE.md\nGEMINI.md\n.memory/\n";
-const PEMGUIN_PROJECT_CONFIG_TEMPLATE: &str = "[setup]\nskip = []\nblock = []\n";
+const PEMGUIN_MCP_SERVER_NAME: &str = "pemguin";
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -149,42 +186,6 @@ struct Config {
     projects: ProjectsConfig,
     #[serde(default)]
     theme: ThemeConfig,
-}
-
-#[derive(Clone, serde::Deserialize, serde::Serialize, Default)]
-struct ProjectPemguinConfig {
-    #[serde(default, skip_serializing_if = "ProjectProjectConfig::is_empty")]
-    project: ProjectProjectConfig,
-    #[serde(default, skip_serializing_if = "ProjectSetupConfig::is_empty")]
-    setup: ProjectSetupConfig,
-}
-
-#[derive(Clone, serde::Deserialize, serde::Serialize, Default)]
-struct ProjectProjectConfig {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    stack: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    agents: Vec<String>,
-}
-
-impl ProjectProjectConfig {
-    fn is_empty(&self) -> bool {
-        self.stack.is_none() && self.agents.is_empty()
-    }
-}
-
-#[derive(Clone, serde::Deserialize, serde::Serialize, Default)]
-struct ProjectSetupConfig {
-    #[serde(default, alias = "ignore", skip_serializing_if = "Vec::is_empty")]
-    skip: Vec<String>,
-    #[serde(default, alias = "disable", skip_serializing_if = "Vec::is_empty")]
-    block: Vec<String>,
-}
-
-impl ProjectSetupConfig {
-    fn is_empty(&self) -> bool {
-        self.skip.is_empty() && self.block.is_empty()
-    }
 }
 
 #[derive(Clone, serde::Deserialize, Default)]
@@ -201,11 +202,12 @@ fn load_config() -> Config {
         .unwrap_or_default()
 }
 
-fn load_project_pemguin_config(path: &Path) -> ProjectPemguinConfig {
-    fs::read_to_string(path.join(".pemguin.toml"))
-        .ok()
-        .and_then(|s| toml::from_str(&s).ok())
-        .unwrap_or_default()
+fn sanitize_project_component(project_path: &Path) -> String {
+    project_path
+        .to_string_lossy()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '-' })
+        .collect()
 }
 
 // ── Data ──────────────────────────────────────────────────────────────────────
@@ -260,7 +262,28 @@ struct MemoryFile {
     name: String,
     path: PathBuf,
     content: String,
+    origin: Option<MemoryAgent>,
 }
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum MemoryAgent {
+    Claude,
+    Codex,
+    Gemini,
+    Pi,
+}
+
+impl MemoryAgent {
+    fn label(self) -> &'static str {
+        match self {
+            MemoryAgent::Claude => "claude",
+            MemoryAgent::Codex => "codex",
+            MemoryAgent::Gemini => "gemini",
+            MemoryAgent::Pi => "pi",
+        }
+    }
+}
+
 
 struct Issue {
     number: u64,
@@ -269,6 +292,7 @@ struct Issue {
     labels: Vec<String>,
 }
 
+#[derive(Clone)]
 struct Project {
     path: PathBuf,
     group: String, // parent dir name relative to base; "" for top-level repos
@@ -277,8 +301,10 @@ struct Project {
     dirty_count: u32,  // number of uncommitted changes
     commits_ahead: u32,
     commits_behind: u32,
-    setup_ok: usize,
-    setup_total: usize,
+    recommended_ok: usize,
+    recommended_total: usize,
+    mcp_ready: bool,
+    template_count: usize,
 }
 
 #[derive(Clone)]
@@ -292,14 +318,37 @@ enum ProjectEntry {
 #[derive(PartialEq, Clone)]
 enum ProjectTab {
     Home,
+    Config,
     Issues,
-    Setup,
     Prompts,
     Memories,
-    Skills,
-    Mcp,
+    Agents,
     Pane,
+}
+
+#[derive(PartialEq, Clone, Copy)]
+enum AgentSection {
+    Mcp,
+    Skills,
     Sessions,
+}
+
+impl AgentSection {
+    fn next(self) -> Self {
+        match self {
+            AgentSection::Mcp => AgentSection::Skills,
+            AgentSection::Skills => AgentSection::Sessions,
+            AgentSection::Sessions => AgentSection::Mcp,
+        }
+    }
+
+    fn prev(self) -> Self {
+        match self {
+            AgentSection::Mcp => AgentSection::Sessions,
+            AgentSection::Skills => AgentSection::Mcp,
+            AgentSection::Sessions => AgentSection::Skills,
+        }
+    }
 }
 
 #[derive(PartialEq, Clone, Debug)]
@@ -307,6 +356,7 @@ enum AgentKind {
     Claude,
     Codex,
     Gemini,
+    Pi,
 }
 
 impl AgentKind {
@@ -315,10 +365,11 @@ impl AgentKind {
             AgentKind::Claude => "claude",
             AgentKind::Codex => "codex",
             AgentKind::Gemini => "gemini",
+            AgentKind::Pi => "pi",
         }
     }
 
-    fn launch_cmd(&self, project_path: &Path, prompt: Option<&str>) -> String {
+    fn launch_cmd(&self, project_path: &Path, _prompt: Option<&str>) -> String {
         let mcp = project_path.join(".mcp.json");
         let has_mcp = mcp.exists();
         match self {
@@ -327,19 +378,11 @@ impl AgentKind {
                 if has_mcp {
                     cmd.push_str(" --mcp-config .mcp.json");
                 }
-                if let Some(p) = prompt {
-                    cmd.push_str(&format!(" --prompt-file .prompts/{}", p));
-                }
                 cmd
             }
-            AgentKind::Codex => {
-                let mut cmd = String::from("codex");
-                if let Some(p) = prompt {
-                    cmd.push_str(&format!(" --instructions .prompts/{}", p));
-                }
-                cmd
-            }
+            AgentKind::Codex => String::from("codex"),
             AgentKind::Gemini => String::from("gemini"),
+            AgentKind::Pi => String::from("pi"),
         }
     }
 
@@ -348,6 +391,7 @@ impl AgentKind {
             AgentKind::Claude => format!("claude --resume {}", session_id),
             AgentKind::Codex => format!("codex --session {}", session_id),
             AgentKind::Gemini => format!("gemini  # session: {}", session_id),
+            AgentKind::Pi => format!("pi --session {}", session_id),
         }
     }
 
@@ -356,6 +400,7 @@ impl AgentKind {
             "claude" => Some(AgentKind::Claude),
             "codex" => Some(AgentKind::Codex),
             "gemini" => Some(AgentKind::Gemini),
+            "pi" => Some(AgentKind::Pi),
             _ => None,
         }
     }
@@ -366,7 +411,7 @@ struct AgentSession {
     id: Option<String>,        // None until resolved from agent storage
     agent: AgentKind,
     started_at: String,        // ISO 8601
-    prompt: Option<String>,    // .prompts/ filename used, if any
+    prompt: Option<String>,
     first_message: Option<String>,
 }
 
@@ -379,9 +424,9 @@ enum SessionsState {
 
 #[derive(PartialEq, Clone)]
 enum MemoriesView {
-    Project,
-    Global,
-    Claude,
+    Claude,  // ~/.claude/projects/<encoded>/memory/
+    Codex,   // ~/.codex/memories/<repo-name>/
+    Gemini,  // ~/.gemini/GEMINI.md (global, single file)
 }
 
 #[derive(PartialEq, Clone)]
@@ -450,8 +495,8 @@ struct HomeData {
     homepage: Option<String>,       // GitHub homepage URL (custom)
     url: String,                    // https://github.com/owner/repo
     recent_commits: Vec<RecentCommit>,
-    setup_ok: usize,
-    setup_total: usize,
+    recommended_ok: usize,
+    recommended_total: usize,
     stack: Option<String>, // detected stack label
     stars: Option<u32>,
     forks: Option<u32>,
@@ -459,6 +504,35 @@ struct HomeData {
     open_prs: Option<u32>,
     readme: Option<String>,
     dirty_files: Vec<String>,
+    mcp_ready: bool,
+    sessions_count: usize,
+    skills_count: usize,
+}
+
+fn md_frontmatter_status(path: &Path) -> (SetupStatus, Option<String>) {
+    if !path.exists() {
+        return (SetupStatus::Missing, None);
+    }
+    let (status, updated) = read_frontmatter(path);
+    let s = match status.as_deref() {
+        Some("template") => SetupStatus::Template,
+        Some("stale")    => SetupStatus::Stale,
+        Some("complete") => SetupStatus::Ok,
+        _                => SetupStatus::Ok,
+    };
+    (s, updated)
+}
+
+fn setup_item_present(items: &[SetupItem], label: &str) -> bool {
+    items.iter().any(|item| item.label == label && item.status == SetupStatus::Ok)
+}
+
+fn setup_template_count(items: &[SetupItem]) -> usize {
+    items.iter().filter(|item| item.status == SetupStatus::Template).count()
+}
+
+fn count_sessions(project_path: &Path) -> usize {
+    load_sessions(project_path).len()
 }
 
 fn detect_stack(path: &Path) -> Option<String> {
@@ -580,10 +654,12 @@ fn load_home_data(path: &Path, repo: &str) -> HomeData {
     // Recent commits
     let recent_commits = load_recent_commits(path);
 
-    // Setup health
     let items = scan_setup(path);
-    let setup_total = items.len();
-    let setup_ok = items.iter().filter(|i| i.status == SetupStatus::Ok).count();
+    let recommended_ok = items.iter().filter(|i| i.status == SetupStatus::Ok).count();
+    let recommended_total = items.len();
+    let mcp_ready = path.join(".mcp.json").exists();
+    let sessions_count = count_sessions(path);
+    let skills_count = load_skills(path).len();
 
     let stack = detect_stack(path);
     let readme = load_readme(path);
@@ -594,8 +670,8 @@ fn load_home_data(path: &Path, repo: &str) -> HomeData {
         homepage,
         url,
         recent_commits,
-        setup_ok,
-        setup_total,
+        recommended_ok,
+        recommended_total,
         stack,
         stars,
         forks,
@@ -603,6 +679,9 @@ fn load_home_data(path: &Path, repo: &str) -> HomeData {
         open_prs,
         readme,
         dirty_files,
+        mcp_ready,
+        sessions_count,
+        skills_count,
     }
 }
 
@@ -616,8 +695,11 @@ fn load_home_data_local(path: &Path, repo: &str) -> HomeData {
     let recent_commits = load_recent_commits(path);
 
     let items = scan_setup(path);
-    let setup_total = items.len();
-    let setup_ok = items.iter().filter(|i| i.status == SetupStatus::Ok).count();
+    let recommended_ok = items.iter().filter(|i| i.status == SetupStatus::Ok).count();
+    let recommended_total = items.len();
+    let mcp_ready = path.join(".mcp.json").exists();
+    let sessions_count = count_sessions(path);
+    let skills_count = load_skills(path).len();
 
     let stack = detect_stack(path);
     let readme = load_readme(path);
@@ -628,8 +710,8 @@ fn load_home_data_local(path: &Path, repo: &str) -> HomeData {
         homepage: None,
         url,
         recent_commits,
-        setup_ok,
-        setup_total,
+        recommended_ok,
+        recommended_total,
         stack,
         stars: None,
         forks: None,
@@ -637,6 +719,9 @@ fn load_home_data_local(path: &Path, repo: &str) -> HomeData {
         open_prs: None,
         readme,
         dirty_files,
+        mcp_ready,
+        sessions_count,
+        skills_count,
     }
 }
 
@@ -647,6 +732,18 @@ enum SetupStatus {
     Ok,
     Missing,
     Stale,
+    Template,
+}
+
+impl SetupStatus {
+    fn as_str(&self) -> &'static str {
+        match self {
+            SetupStatus::Ok => "ok",
+            SetupStatus::Missing => "missing",
+            SetupStatus::Stale => "stale",
+            SetupStatus::Template => "template",
+        }
+    }
 }
 
 enum SetupAction {
@@ -661,26 +758,22 @@ enum SetupRenderRow {
 }
 
 fn setup_render_rows(items: &[SetupItem]) -> Vec<SetupRenderRow> {
-    let installed: Vec<usize> = items
-        .iter()
-        .enumerate()
-        .filter_map(|(i, it)| matches!(it.status, SetupStatus::Ok).then_some(i))
-        .collect();
-    let not_installed: Vec<usize> = items
-        .iter()
-        .enumerate()
-        .filter_map(|(i, it)| (!matches!(it.status, SetupStatus::Ok)).then_some(i))
-        .collect();
     let mut rows = vec![];
-    if !installed.is_empty() {
-        rows.push(SetupRenderRow::GroupHeader("installed"));
-        for i in installed {
-            rows.push(SetupRenderRow::Item(i));
+    for (label, category) in [
+        ("initialization", SetupCategory::Initialization),
+        ("recommended files", SetupCategory::Recommended),
+        ("repair", SetupCategory::Repair),
+    ] {
+        let indices: Vec<usize> = items
+            .iter()
+            .enumerate()
+            .filter_map(|(i, it)| (it.category == category).then_some(i))
+            .collect();
+        if indices.is_empty() {
+            continue;
         }
-    }
-    if !not_installed.is_empty() {
-        rows.push(SetupRenderRow::GroupHeader("not installed"));
-        for i in not_installed {
+        rows.push(SetupRenderRow::GroupHeader(label));
+        for i in indices {
             rows.push(SetupRenderRow::Item(i));
         }
     }
@@ -697,290 +790,131 @@ fn selected_setup_item(items: &[SetupItem], list_state: &ListState) -> Option<us
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SetupCategory {
+    Initialization,
+    Recommended,
+    Repair,
+}
+
+impl SetupCategory {
+    fn as_str(&self) -> &'static str {
+        match self {
+            SetupCategory::Initialization => "initialization",
+            SetupCategory::Recommended => "recommended",
+            SetupCategory::Repair => "repair",
+        }
+    }
+}
+
 #[derive(Clone)]
 struct SetupItem {
     label: &'static str,
-    detail: &'static str,
+    detail: String,
+    category: SetupCategory,
     status: SetupStatus,
     gitignore_path: Option<&'static str>,  // entry in .gitignore, None if not toggleable
     gitignored: bool,                       // currently present in # Pemguin TUI block
 }
 
-fn setup_item_skipped(cfg: &ProjectPemguinConfig, label: &str) -> bool {
-    cfg.setup.skip.iter().any(|s| s == label)
-}
-
-fn setup_item_blocked(cfg: &ProjectPemguinConfig, label: &str) -> bool {
-    cfg.setup.block.iter().any(|s| s == label)
-}
-
-const KNOWN_SETUP_LABELS: &[&str] = &[
-    "AGENT.md",
-    "SPEC.md",
-    "CLAUDE.md → AGENT.md",
-    "GEMINI.md → AGENT.md",
-    "docs/",
-    ".gitignore",
-    ".prompts/",
-    ".memory/",
-    ".pemguin/",
-    ".pemguin.toml",
-];
-
-const KNOWN_AGENTS: &[&str] = &["claude", "codex", "gemini"];
-
-#[derive(Clone)]
-enum TomlRow {
-    Section(String),
-    TextField { field: &'static str, label: &'static str, value: String },
-    Checkbox { section: &'static str, field: &'static str, label: &'static str, checked: bool },
-}
-
-impl TomlRow {
-    fn is_focusable(&self) -> bool {
-        !matches!(self, TomlRow::Section(_))
+fn read_frontmatter(path: &Path) -> (Option<String>, Option<String>) {
+    // returns (status, updated)
+    let content = match fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(_) => return (None, None),
+    };
+    let mut lines = content.lines();
+    if lines.next().map(|l| l.trim()) != Some("---") {
+        return (None, None);
     }
-}
-
-struct TomlEditorState {
-    project_path: PathBuf,
-    config: ProjectPemguinConfig,
-    cursor: usize,     // index into focusable rows only
-    text_input: Option<String>,
-    text_field: Option<&'static str>,
-    message: Option<String>,
-}
-
-fn toml_rows(config: &ProjectPemguinConfig) -> Vec<TomlRow> {
-    let mut rows = vec![];
-
-    rows.push(TomlRow::Section("[project]".to_string()));
-    rows.push(TomlRow::TextField {
-        field: "stack",
-        label: "stack",
-        value: config.project.stack.clone().unwrap_or_default(),
-    });
-    rows.push(TomlRow::Section("  agents:".to_string()));
-    for agent in KNOWN_AGENTS {
-        rows.push(TomlRow::Checkbox {
-            section: "project",
-            field: "agents",
-            label: agent,
-            checked: config.project.agents.contains(&agent.to_string()),
-        });
+    let mut status = None;
+    let mut updated = None;
+    for line in lines {
+        if line.trim() == "---" { break; }
+        if let Some(rest) = line.strip_prefix("status:") {
+            status = Some(rest.trim().to_string());
+        }
+        if let Some(rest) = line.strip_prefix("updated:") {
+            updated = Some(rest.trim().to_string());
+        }
     }
-
-    rows.push(TomlRow::Section("[setup] skip — hide from score".to_string()));
-    for label in KNOWN_SETUP_LABELS {
-        rows.push(TomlRow::Checkbox {
-            section: "setup",
-            field: "skip",
-            label,
-            checked: config.setup.skip.contains(&label.to_string()),
-        });
-    }
-
-    rows.push(TomlRow::Section("[setup] block — refuse to apply".to_string()));
-    for label in KNOWN_SETUP_LABELS {
-        rows.push(TomlRow::Checkbox {
-            section: "setup",
-            field: "block",
-            label,
-            checked: config.setup.block.contains(&label.to_string()),
-        });
-    }
-
-    rows
+    (status, updated)
 }
 
-fn focusable_indices(rows: &[TomlRow]) -> Vec<usize> {
-    rows.iter()
-        .enumerate()
-        .filter_map(|(i, r)| if r.is_focusable() { Some(i) } else { None })
-        .collect()
+fn read_frontmatter_status(path: &Path) -> Option<String> {
+    read_frontmatter(path).0
 }
 
-fn save_pemguin_toml(project_path: &Path, config: &ProjectPemguinConfig) -> Result<(), String> {
-    let path = project_path.join(".pemguin.toml");
-    let content = toml::to_string_pretty(config).map_err(|e| e.to_string())?;
-    fs::write(&path, content).map_err(|e| e.to_string())
+fn md_file_status(path: &Path, base_detail: &str) -> (SetupStatus, String) {
+    if !path.exists() {
+        return (SetupStatus::Missing, base_detail.to_string());
+    }
+    match read_frontmatter_status(path).as_deref() {
+        Some("template") => (SetupStatus::Template, format!("{base_detail} — template")),
+        Some("stale")    => (SetupStatus::Stale,    format!("{base_detail} — stale")),
+        Some("complete") => (SetupStatus::Ok,        base_detail.to_string()),
+        _                => (SetupStatus::Ok,        base_detail.to_string()),
+    }
 }
 
 fn scan_setup(path: &Path) -> Vec<SetupItem> {
-    let cfg = load_project_pemguin_config(path);
-    let gitignored = read_gitignore_block_entries(path);
-    let agent_ok = path.join("AGENT.md").exists();
-    let spec_ok = path.join("SPEC.md").exists();
-    let claude_ok = {
-        let p = path.join("CLAUDE.md");
-        p.is_symlink() || p.exists()
-    };
-    let gemini_ok = {
-        let p = path.join("GEMINI.md");
-        p.is_symlink() || p.exists()
-    };
-    let docs_ok = path.join("docs").is_dir();
-    let gitignore_ok = fs::read_to_string(path.join(".gitignore"))
-        .map(|s| s.contains("# Pemguin TUI") || s.contains("# Agent dirs"))
-        .unwrap_or(false);
-    let agents_stale = path.join("AGENTS.md").exists();
-    let prompts_ok = path.join(".prompts").is_dir();
-    let memory_ok = path.join(".memory").join("MEMORY.md").exists();
-    let pemguin_dir_ok = path.join(".pemguin").is_dir();
-    let pemguin_cfg_ok = path.join(".pemguin.toml").exists();
+    scan_setup_all(path)
+}
 
-    let mut items = vec![
+fn scan_setup_all(path: &Path) -> Vec<SetupItem> {
+    scan_setup_unfiltered(path)
+}
+
+fn scan_setup_unfiltered(path: &Path) -> Vec<SetupItem> {
+    let claude_ok = { let p = path.join("CLAUDE.md"); p.is_symlink() || p.exists() };
+    let agents_ok = { let p = path.join("AGENTS.md"); p.is_symlink() || p.exists() };
+    let gemini_ok = { let p = path.join("GEMINI.md"); p.is_symlink() || p.exists() };
+    let mcp_ok    = path.join(".mcp.json").exists();
+
+    vec![
         SetupItem {
-            label: "AGENT.md",
-            detail: "agent context file",
-            status: if agent_ok {
-                SetupStatus::Ok
-            } else {
-                SetupStatus::Missing
-            },
+            label: "CLAUDE.md",
+            detail: "Claude Code context file".to_string(),
+            category: SetupCategory::Recommended,
+            status: if claude_ok { SetupStatus::Ok } else { SetupStatus::Missing },
             gitignore_path: None,
             gitignored: false,
         },
         SetupItem {
-            label: "SPEC.md",
-            detail: "feature spec",
-            status: if spec_ok {
-                SetupStatus::Ok
-            } else {
-                SetupStatus::Missing
-            },
-            gitignore_path: None,
-            gitignored: false,
-        },
-        SetupItem {
-            label: "CLAUDE.md → AGENT.md",
-            detail: "symlink for Claude Code",
-            status: if claude_ok {
-                SetupStatus::Ok
-            } else {
-                SetupStatus::Missing
-            },
-            gitignore_path: Some("CLAUDE.md"),
-            gitignored: gitignored.contains(&"CLAUDE.md".to_string()),
-        },
-        SetupItem {
-            label: "GEMINI.md → AGENT.md",
-            detail: "symlink for Gemini",
-            status: if gemini_ok {
-                SetupStatus::Ok
-            } else {
-                SetupStatus::Missing
-            },
-            gitignore_path: Some("GEMINI.md"),
-            gitignored: gitignored.contains(&"GEMINI.md".to_string()),
-        },
-        SetupItem {
-            label: "docs/",
-            detail: "architecture/features skeleton",
-            status: if docs_ok {
-                SetupStatus::Ok
-            } else {
-                SetupStatus::Missing
-            },
-            gitignore_path: None,
-            gitignored: false,
-        },
-        SetupItem {
-            label: ".gitignore",
-            detail: "agent dirs excluded",
-            status: if gitignore_ok {
-                SetupStatus::Ok
-            } else {
-                SetupStatus::Missing
-            },
-            gitignore_path: None,
-            gitignored: false,
-        },
-        SetupItem {
-            label: ".prompts/",
-            detail: "project-local prompts",
-            status: if prompts_ok {
-                SetupStatus::Ok
-            } else {
-                SetupStatus::Missing
-            },
-            gitignore_path: Some(".prompts/"),
-            gitignored: gitignored.contains(&".prompts/".to_string()),
-        },
-        SetupItem {
-            label: ".memory/",
-            detail: "agent memory index",
-            status: if memory_ok {
-                SetupStatus::Ok
-            } else {
-                SetupStatus::Missing
-            },
-            gitignore_path: Some(".memory/"),
-            gitignored: gitignored.contains(&".memory/".to_string()),
-        },
-        SetupItem {
-            label: ".pemguin/",
-            detail: "sessions, exports, local state",
-            status: if pemguin_dir_ok { SetupStatus::Ok } else { SetupStatus::Missing },
-            gitignore_path: Some(".pemguin/"),
-            gitignored: gitignored.contains(&".pemguin/".to_string()),
-        },
-        SetupItem {
-            label: ".pemguin.toml",
-            detail: "repo-local pemguin config",
-            status: if pemguin_cfg_ok {
-                SetupStatus::Ok
-            } else {
-                SetupStatus::Missing
-            },
-            gitignore_path: None,
-            gitignored: false,
-        },
-    ];
-    if agents_stale {
-        items.push(SetupItem {
             label: "AGENTS.md",
-            detail: "stale file — delete it",
-            status: SetupStatus::Stale,
+            detail: "Codex / Pi context file".to_string(),
+            category: SetupCategory::Recommended,
+            status: if agents_ok { SetupStatus::Ok } else { SetupStatus::Missing },
             gitignore_path: None,
             gitignored: false,
-        });
-    }
-    items.retain(|item| {
-        !setup_item_skipped(&cfg, item.label) && !setup_item_blocked(&cfg, item.label)
-    });
-    items
+        },
+        SetupItem {
+            label: "GEMINI.md",
+            detail: "Gemini CLI context file".to_string(),
+            category: SetupCategory::Recommended,
+            status: if gemini_ok { SetupStatus::Ok } else { SetupStatus::Missing },
+            gitignore_path: None,
+            gitignored: false,
+        },
+        SetupItem {
+            label: ".mcp.json",
+            detail: "MCP server definitions".to_string(),
+            category: SetupCategory::Recommended,
+            status: if mcp_ok { SetupStatus::Ok } else { SetupStatus::Missing },
+            gitignore_path: None,
+            gitignored: false,
+        },
+    ]
 }
 
 fn setup_item_edit_path(project_path: &Path, item: &SetupItem) -> Option<PathBuf> {
     match item.label {
-        "AGENT.md" | "CLAUDE.md → AGENT.md" | "GEMINI.md → AGENT.md" => {
-            Some(project_path.join("AGENT.md"))
-        }
-        "SPEC.md" => Some(project_path.join("SPEC.md")),
-        "docs/" => Some(project_path.join("docs").join("README.md")),
-        ".gitignore" => Some(project_path.join(".gitignore")),
-        ".prompts/" => Some(project_path.join(".prompts").join("work-on-task.md")),
-        ".memory/" => Some(project_path.join(".memory").join("MEMORY.md")),
-        ".pemguin.toml" => Some(project_path.join(".pemguin.toml")),
-        "AGENTS.md" => Some(project_path.join("AGENTS.md")),
+        "CLAUDE.md"  => Some(project_path.join("CLAUDE.md")),
+        "AGENTS.md"  => Some(project_path.join("AGENTS.md")),
+        "GEMINI.md"  => Some(project_path.join("GEMINI.md")),
+        ".mcp.json"  => Some(project_path.join(".mcp.json")),
         _ => None,
     }
-}
-
-fn remove_gitignore_block(project_path: &Path) -> Result<(), String> {
-    let gitignore = project_path.join(".gitignore");
-    let content = match fs::read_to_string(&gitignore) {
-        Ok(s) => s,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e.to_string()),
-    };
-    // Remove current block heading and legacy "# Agent dirs" heading
-    let legacy = GITIGNORE_BLOCK.replace("# Pemguin TUI", "# Agent dirs");
-    let next = content
-        .replace(GITIGNORE_BLOCK, "\n")
-        .replace(&legacy, "\n");
-    fs::write(&gitignore, next).map_err(|e| e.to_string())
 }
 
 fn read_gitignore_block_entries(project_path: &Path) -> Vec<String> {
@@ -1080,272 +1014,56 @@ fn apply_setup_item(
     item: &SetupItem,
     action: SetupAction,
 ) -> Result<String, String> {
-    let project_cfg = load_project_pemguin_config(project_path);
-    if setup_item_blocked(&project_cfg, item.label) {
-        return Ok(format!(
-            "{} blocked by .pemguin.toml — skipped",
-            item.label
-        ));
-    }
-    let pemguin_dir = std::env::var("PEMGUIN_DIR")
-        .or_else(|_| std::env::var("SCAFFOLD_DIR"))
-        .map(PathBuf::from)
-        .map_err(|_| "$PEMGUIN_DIR not set".to_string())?;
-
     match item.label {
-        "AGENT.md" => {
-            let dst = project_path.join("AGENT.md");
-            if matches!(action, SetupAction::Apply) && dst.exists() {
-                return Ok("AGENT.md already exists — skipped".to_string());
-            }
-            fs::copy(template_file(&pemguin_dir, "AGENT.md"), &dst)
-                .map(|_| {
-                    if matches!(action, SetupAction::Reset) {
-                        "Reset AGENT.md".to_string()
-                    } else {
-                        "Created AGENT.md".to_string()
-                    }
-                })
-                .map_err(|e| e.to_string())
-        }
-        "SPEC.md" => {
-            let dst = project_path.join("SPEC.md");
-            if matches!(action, SetupAction::Apply) && dst.exists() {
-                return Ok("SPEC.md already exists — skipped".to_string());
-            }
-            fs::copy(template_file(&pemguin_dir, "SPEC.md"), &dst)
-                .map(|_| {
-                    if matches!(action, SetupAction::Reset) {
-                        "Reset SPEC.md".to_string()
-                    } else {
-                        "Created SPEC.md".to_string()
-                    }
-                })
-                .map_err(|e| e.to_string())
-        }
-        "CLAUDE.md → AGENT.md" => match action {
+        "CLAUDE.md" => match action {
             SetupAction::Delete => fs::remove_file(project_path.join("CLAUDE.md"))
                 .map(|_| "Removed CLAUDE.md".to_string())
                 .map_err(|e| e.to_string()),
             SetupAction::Apply | SetupAction::Reset => {
-                let dst = project_path.join("CLAUDE.md");
-                if matches!(action, SetupAction::Apply) && dst.exists() {
-                    return Ok("CLAUDE.md already exists — skipped".to_string());
-                }
-                if dst.exists() {
-                    let _ = fs::remove_file(&dst);
-                }
-                std::os::unix::fs::symlink("AGENT.md", dst)
-                    .map(|_| {
-                        if matches!(action, SetupAction::Reset) {
-                            "Reset CLAUDE.md → AGENT.md".to_string()
-                        } else {
-                            "Symlinked CLAUDE.md → AGENT.md".to_string()
-                        }
-                    })
-                    .map_err(|e| e.to_string())
+                let p = project_path.join("CLAUDE.md");
+                if !p.exists() { fs::write(&p, "").map_err(|e| e.to_string())?; }
+                Ok("CLAUDE.md ready".to_string())
             }
         },
-        "GEMINI.md → AGENT.md" => match action {
+        "AGENTS.md" => match action {
+            SetupAction::Delete => fs::remove_file(project_path.join("AGENTS.md"))
+                .map(|_| "Removed AGENTS.md".to_string())
+                .map_err(|e| e.to_string()),
+            SetupAction::Apply | SetupAction::Reset => {
+                let p = project_path.join("AGENTS.md");
+                if !p.exists() { fs::write(&p, "").map_err(|e| e.to_string())?; }
+                Ok("AGENTS.md ready".to_string())
+            }
+        },
+        "GEMINI.md" => match action {
             SetupAction::Delete => fs::remove_file(project_path.join("GEMINI.md"))
                 .map(|_| "Removed GEMINI.md".to_string())
                 .map_err(|e| e.to_string()),
             SetupAction::Apply | SetupAction::Reset => {
-                let dst = project_path.join("GEMINI.md");
-                if matches!(action, SetupAction::Apply) && dst.exists() {
-                    return Ok("GEMINI.md already exists — skipped".to_string());
-                }
-                if dst.exists() {
-                    let _ = fs::remove_file(&dst);
-                }
-                std::os::unix::fs::symlink("AGENT.md", dst)
-                    .map(|_| {
-                        if matches!(action, SetupAction::Reset) {
-                            "Reset GEMINI.md → AGENT.md".to_string()
-                        } else {
-                            "Symlinked GEMINI.md → AGENT.md".to_string()
-                        }
-                    })
-                    .map_err(|e| e.to_string())
+                let p = project_path.join("GEMINI.md");
+                if !p.exists() { fs::write(&p, "").map_err(|e| e.to_string())?; }
+                Ok("GEMINI.md ready".to_string())
             }
         },
-        "docs/" => {
-            let src = pemguin_dir.join("templates").join("docs");
-            let dst = project_path.join("docs");
-            match action {
-                SetupAction::Delete => fs::remove_dir_all(&dst)
-                    .map(|_| "Removed docs/".to_string())
-                    .map_err(|e| e.to_string()),
-                SetupAction::Apply => {
-                    if dst.exists() {
-                        return Ok("docs/ already exists — skipped".to_string());
-                    }
-                    copy_dir_recursive(&src, &dst)
-                        .map(|_| "Created docs/".to_string())
-                        .map_err(|e| e.to_string())
-                }
-                SetupAction::Reset => copy_dir_recursive(&src, &dst)
-                    .map(|_| "Reset docs/".to_string())
-                    .map_err(|e| e.to_string()),
-            }
-        }
-        ".memory/" => {
-            let dir = project_path.join(".memory");
-            let index = dir.join("MEMORY.md");
-            match action {
-                SetupAction::Delete => fs::remove_dir_all(&dir)
-                    .map(|_| "Removed .memory/".to_string())
-                    .map_err(|e| e.to_string()),
-                SetupAction::Apply => {
-                    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-                    if index.exists() {
-                        return Ok(".memory/MEMORY.md already exists — skipped".to_string());
-                    }
-                    fs::write(&index, MEMORY_INDEX_TEMPLATE).map_err(|e| e.to_string())?;
-                    Ok("Created .memory/MEMORY.md".to_string())
-                }
-                SetupAction::Reset => {
-                    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-                    fs::write(&index, MEMORY_INDEX_TEMPLATE).map_err(|e| e.to_string())?;
-                    Ok("Reset .memory/MEMORY.md".to_string())
-                }
-            }
-        }
-        ".gitignore" => match action {
-            SetupAction::Delete => {
-                remove_gitignore_block(project_path)?;
-                Ok("Removed pemguin block from .gitignore".to_string())
-            }
-            SetupAction::Apply => {
-                let gitignore = project_path.join(".gitignore");
-                let current = fs::read_to_string(&gitignore).unwrap_or_default();
-                if current.contains("# Pemguin TUI") || current.contains("# Agent dirs") {
-                    return Ok(".gitignore already patched — skipped".to_string());
-                }
-                let mut f = fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&gitignore)
-                    .map_err(|e| e.to_string())?;
-                use std::io::Write;
-                f.write_all(GITIGNORE_BLOCK.as_bytes())
-                    .map_err(|e| e.to_string())?;
-                Ok("Patched .gitignore".to_string())
-            }
-            SetupAction::Reset => {
-                remove_gitignore_block(project_path)?;
-                let gitignore = project_path.join(".gitignore");
-                let mut f = fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&gitignore)
-                    .map_err(|e| e.to_string())?;
-                use std::io::Write;
-                f.write_all(GITIGNORE_BLOCK.as_bytes())
-                    .map_err(|e| e.to_string())?;
-                Ok("Reset .gitignore pemguin block".to_string())
+        ".mcp.json" => match action {
+            SetupAction::Delete => fs::remove_file(project_path.join(".mcp.json"))
+                .map(|_| "Removed .mcp.json".to_string())
+                .map_err(|e| e.to_string()),
+            SetupAction::Apply | SetupAction::Reset => {
+                let p = project_path.join(".mcp.json");
+                if !p.exists() { fs::write(&p, "{}").map_err(|e| e.to_string())?; }
+                Ok(".mcp.json ready".to_string())
             }
         },
-        ".prompts/" => {
-            let dir = project_path.join(".prompts");
-            let sample = dir.join("work-on-task.md");
-            match action {
-                SetupAction::Delete => fs::remove_dir_all(&dir)
-                    .map(|_| "Removed .prompts/".to_string())
-                    .map_err(|e| e.to_string()),
-                SetupAction::Apply => {
-                    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-                    if sample.exists() {
-                        return Ok(".prompts/work-on-task.md already exists — skipped".to_string());
-                    }
-                    fs::copy(
-                        template_file(&pemguin_dir, "prompts/work-on-task.md"),
-                        &sample,
-                    )
-                    .map_err(|e| e.to_string())?;
-                    Ok("Created .prompts/ with sample prompt".to_string())
-                }
-                SetupAction::Reset => {
-                    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-                    fs::copy(
-                        template_file(&pemguin_dir, "prompts/work-on-task.md"),
-                        &sample,
-                    )
-                    .map_err(|e| e.to_string())?;
-                    Ok("Reset .prompts/work-on-task.md".to_string())
-                }
-            }
-        }
-        ".pemguin.toml" => {
-            let path = project_path.join(".pemguin.toml");
-            match action {
-                SetupAction::Delete => fs::remove_file(&path)
-                    .map(|_| "Removed .pemguin.toml".to_string())
-                    .map_err(|e| e.to_string()),
-                SetupAction::Apply => {
-                    if path.exists() {
-                        return Ok(".pemguin.toml already exists — skipped".to_string());
-                    }
-                    fs::write(&path, PEMGUIN_PROJECT_CONFIG_TEMPLATE).map_err(|e| e.to_string())?;
-                    Ok("Created .pemguin.toml".to_string())
-                }
-                SetupAction::Reset => {
-                    fs::write(&path, PEMGUIN_PROJECT_CONFIG_TEMPLATE).map_err(|e| e.to_string())?;
-                    Ok("Reset .pemguin.toml".to_string())
-                }
-            }
-        }
-        "AGENTS.md" => fs::remove_file(project_path.join("AGENTS.md"))
-            .map(|_| "Removed stale AGENTS.md".to_string())
-            .map_err(|e| e.to_string()),
         _ => Err("unknown item".to_string()),
     }
 }
 
 fn edit_setup_item(project_path: &Path, item: &SetupItem) -> Result<PathBuf, String> {
-    let project_cfg = load_project_pemguin_config(project_path);
-    if setup_item_blocked(&project_cfg, item.label) {
-        return Err(format!("{} blocked by .pemguin.toml", item.label));
-    }
     if item.status == SetupStatus::Missing {
         let _ = apply_setup_item(project_path, item, SetupAction::Apply)?;
     }
     setup_item_edit_path(project_path, item).ok_or_else(|| "item is not editable".to_string())
-}
-
-fn template_file(pemguin_dir: &Path, relative: &str) -> PathBuf {
-    pemguin_dir.join("templates").join(relative)
-}
-
-fn copy_dir_recursive(src: &Path, dst: &Path) -> io::Result<()> {
-    fs::create_dir_all(dst)?;
-    for entry in fs::read_dir(src)? {
-        let entry = entry?;
-        let ty = entry.file_type()?;
-        let dst_path = dst.join(entry.file_name());
-        if ty.is_dir() {
-            copy_dir_recursive(&entry.path(), &dst_path)?;
-        } else {
-            fs::copy(entry.path(), dst_path)?;
-        }
-    }
-    Ok(())
-}
-
-fn apply_all_setup(project_path: &Path) -> Result<String, String> {
-    let mut applied = Vec::new();
-    for item in scan_setup(project_path) {
-        if item.status == SetupStatus::Stale {
-            continue;
-        }
-        let msg = apply_setup_item(project_path, &item, SetupAction::Apply)?;
-        applied.push(msg);
-    }
-    if applied.is_empty() {
-        Ok("Nothing to apply.".to_string())
-    } else {
-        Ok(applied.join(" | "))
-    }
 }
 
 enum PromptState {
@@ -1387,7 +1105,7 @@ struct App {
     screen: Screen,
     // Prompts
     global_prompts: Vec<Prompt>, // always loaded from $PEMGUIN_DIR/prompts
-    project_prompts: Vec<Prompt>, // loaded from <project>/.prompts/ on drill-in
+    project_prompts: Vec<Prompt>, // loaded from <project>/.pemguin/prompts/ on drill-in
     prompts_view: PromptsView,
     prompts: Vec<Prompt>, // current display list (points at global or project)
     prompt_display_rows: Vec<PromptDisplayRow>, // flat + grouped rows for rendering
@@ -1421,7 +1139,7 @@ struct App {
     setup_items: Vec<SetupItem>,
     setup_list_state: ListState,
     setup_message: Option<String>,
-    setup_toml_editor: Option<TomlEditorState>,
+    setup_on_open: bool,
     // GitHub metadata cache (keyed by "owner/repo")
     meta_cache: HashMap<String, RepoMeta>,
     // Avatar cache (keyed by "owner" -> raw chafa ANSI output)
@@ -1453,9 +1171,11 @@ struct App {
     skills_browse_indices: Vec<usize>,
     skills_install_message: Option<String>,
     // MCP
+    agent_section: AgentSection,
     mcp_servers: Vec<McpServer>,
     mcp_list_state: ListState,
     mcp_loaded: bool,
+    mcp_message: Option<String>,
     pane_list_state: ListState,
     pane_message: Option<String>,
     // Sessions
@@ -1741,11 +1461,10 @@ fn project_info(path: &Path, group: String) -> Option<Project> {
         });
     let (branch, dirty_count, ahead, behind) = git_status_summary(path);
     let setup_items = scan_setup(path);
-    let setup_total = setup_items.len();
-    let setup_ok = setup_items
-        .iter()
-        .filter(|i| i.status == SetupStatus::Ok)
-        .count();
+    let recommended_ok = setup_items.iter().filter(|i| i.status == SetupStatus::Ok).count();
+    let recommended_total = setup_items.len();
+    let mcp_ready = path.join(".mcp.json").exists();
+    let template_count = setup_template_count(&setup_items);
     Some(Project {
         path: path.to_path_buf(),
         group,
@@ -1754,8 +1473,10 @@ fn project_info(path: &Path, group: String) -> Option<Project> {
         dirty_count,
         commits_ahead: ahead,
         commits_behind: behind,
-        setup_ok,
-        setup_total,
+        recommended_ok,
+        recommended_total,
+        mcp_ready,
+        template_count,
     })
 }
 
@@ -2195,26 +1916,13 @@ fn save_repo_field(repo: &str, field: &HomeEditField, value: &str) -> Result<(),
 
 // ── Memory helpers ────────────────────────────────────────────────────────────
 
-fn global_memory_path() -> PathBuf {
-    dirs_home()
-        .unwrap_or_default()
-        .join(".pemguin")
-        .join("memory")
-}
-
-/// Claude Code sanitizes project paths by replacing all non-alphanumeric chars with '-'.
-fn claude_memory_path(project_path: &Path) -> PathBuf {
-    let s = project_path.to_string_lossy();
-    let sanitized: String = s
-        .chars()
-        .map(|c| if c.is_alphanumeric() { c } else { '-' })
-        .collect();
-    dirs_home()
-        .unwrap_or_default()
-        .join(".claude")
-        .join("projects")
-        .join(sanitized)
-        .join("memory")
+fn claude_memory_path(project_path: &Path) -> Option<PathBuf> {
+    // Returns the first existing ~/.claude/projects/<encoded>/memory/ dir.
+    // Uses claude_project_dirs which checks both v1 and v2 path encodings.
+    claude_project_dirs(project_path)
+        .into_iter()
+        .map(|d| d.join("memory"))
+        .find(|d| d.is_dir())
 }
 
 fn load_memory_files(dir: &Path) -> Vec<MemoryFile> {
@@ -2234,24 +1942,27 @@ fn load_memory_files(dir: &Path) -> Vec<MemoryFile> {
             }
             let name = path.file_stem()?.to_str()?.to_string();
             let content = fs::read_to_string(&path).unwrap_or_default();
-            Some(MemoryFile {
-                name,
-                path,
-                content,
-            })
+            Some(MemoryFile { origin: None, name, path, content })
         })
         .collect()
 }
 
-fn append_to_memory_index(dir: &Path, filename: &str) -> io::Result<()> {
-    let index = dir.join("MEMORY.md");
-    if !index.exists() {
-        fs::write(&index, MEMORY_INDEX_TEMPLATE)?;
-    }
-    let entry = format!("- [{filename}]({filename}) — \n");
-    let mut f = fs::OpenOptions::new().append(true).open(&index)?;
-    use std::io::Write;
-    f.write_all(entry.as_bytes())
+
+fn codex_memory_dirs(project_path: &Path) -> Vec<PathBuf> {
+    let Some(home) = dirs_home() else { return vec![] };
+    let base = home.join(".codex").join("memories");
+    let repo_name = project_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_string();
+    let sanitized = sanitize_project_component(project_path);
+    let candidates = vec![base.join(&repo_name), base.join(&sanitized)];
+    candidates.into_iter().filter(|path| path.is_dir()).collect()
+}
+
+fn gemini_memory_path() -> PathBuf {
+    dirs_home().unwrap_or_default().join(".gemini").join("GEMINI.md")
 }
 
 // ── Skills / MCP loading ──────────────────────────────────────────────────────
@@ -2606,6 +2317,432 @@ fn load_mcp_servers(path: &Path) -> Vec<McpServer> {
     result
 }
 
+fn managed_project_paths() -> Vec<CliManagedPath> {
+    vec![
+        CliManagedPath { path: "AGENT.md".to_string(), kind: "file", required: true },
+        CliManagedPath { path: "SPEC.md".to_string(), kind: "file", required: true },
+        CliManagedPath { path: "docs/".to_string(), kind: "dir", required: true },
+        CliManagedPath { path: ".gitignore".to_string(), kind: "file", required: true },
+        CliManagedPath { path: ".pemguin/".to_string(), kind: "dir", required: true },
+        CliManagedPath { path: ".pemguin/prompts/".to_string(), kind: "dir", required: true },
+        CliManagedPath { path: ".pemguin/memory/".to_string(), kind: "dir", required: true },
+        CliManagedPath { path: "CLAUDE.md".to_string(), kind: "symlink", required: false },
+        CliManagedPath { path: "GEMINI.md".to_string(), kind: "symlink", required: false },
+        CliManagedPath { path: ".mcp.json".to_string(), kind: "file", required: false },
+        CliManagedPath { path: "skills-lock.json".to_string(), kind: "file", required: false },
+    ]
+}
+
+fn setup_item_required(_item: &SetupItem) -> bool {
+    true
+}
+
+fn cli_setup_item(project_path: &Path, item: &SetupItem) -> CliSetupItem {
+    CliSetupItem {
+        id: item.label.to_string(),
+        label: item.label.to_string(),
+        detail: item.detail.clone(),
+        category: item.category.as_str(),
+        status: item.status.as_str(),
+        required: setup_item_required(item),
+        optional: !setup_item_required(item),
+        gitignore_path: item.gitignore_path.map(|s| s.to_string()),
+        gitignored: item.gitignored,
+        edit_path: setup_item_edit_path(project_path, item)
+            .map(|p| p.to_string_lossy().to_string()),
+    }
+}
+
+fn cli_next_actions(project_path: &Path, items: &[SetupItem]) -> Vec<String> {
+    let mut actions = Vec::new();
+    if items.iter().any(|i| i.label == ".pemguin/" && i.status == SetupStatus::Missing) {
+        actions.push(format!("Run `pm setup apply --minimal {}` to initialize pemguin metadata.", project_path.display()));
+    }
+    let missing_required: Vec<&str> = items
+        .iter()
+        .filter(|i| setup_item_required(i) && i.status != SetupStatus::Ok)
+        .map(|i| i.label)
+        .collect();
+    if !missing_required.is_empty() {
+        actions.push(format!(
+            "Run `pm setup apply --standard {}` to create missing managed files: {}.",
+            project_path.display(),
+            missing_required.join(", ")
+        ));
+    }
+    let stale: Vec<&str> = items
+        .iter()
+        .filter(|i| i.status == SetupStatus::Stale)
+        .map(|i| i.label)
+        .collect();
+    if !stale.is_empty() {
+        actions.push(format!("Repair stale items manually or remove them: {}.", stale.join(", ")));
+    }
+    if actions.is_empty() {
+        actions.push("Project setup is complete for all active pemguin-managed required items.".to_string());
+    }
+    actions
+}
+
+fn inspect_project(path: &Path) -> CliProjectInspect {
+    let items = scan_setup_all(path);
+    let recommended_ok = items.iter().filter(|i| i.status == SetupStatus::Ok).count();
+    let recommended_total = items.len();
+    let setup_complete = items.iter().all(|item| item.status == SetupStatus::Ok);
+
+    CliProjectInspect {
+        project_path: path.to_string_lossy().to_string(),
+        repo_root: path.join(".git").exists(),
+        recommended_ok,
+        recommended_total,
+        setup_complete,
+        project_files: managed_project_paths(),
+        items: items.iter().map(|item| cli_setup_item(path, item)).collect(),
+        next_actions: cli_next_actions(path, &items),
+    }
+}
+
+fn agent_instructions(path: &Path) -> CliAgentInstructions {
+    CliAgentInstructions {
+        project_path: path.to_string_lossy().to_string(),
+        summary: "Use pemguin to inspect project context file status.".to_string(),
+        inspect_command: format!("pm project inspect --json {}", path.display()),
+        notes: vec![
+            "Read `CLAUDE.md`, `AGENTS.md`, or `GEMINI.md` when they exist.".to_string(),
+        ],
+    }
+}
+
+fn print_json<T: serde::Serialize>(value: &T) -> io::Result<()> {
+    let out = serde_json::to_string_pretty(value)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+    println!("{out}");
+    Ok(())
+}
+
+fn cli_usage() {
+    println!("pemguin CLI");
+    println!();
+    println!("  pm project inspect [--json] [PATH]");
+    println!("  pm setup plan [--json] [PATH]");
+    println!("  pm setup apply (--minimal|--standard) [--json] [PATH]");
+    println!("  pm setup apply-item <LABEL> [--json] [PATH]");
+    println!("  pm agent instructions [--json] [PATH]");
+    println!("  pm mcp serve");
+    println!("  pm mcp-server");
+    println!();
+    println!("If no subcommand is given, the Ratatui TUI starts.");
+}
+
+fn parse_path_arg(args: &[String]) -> PathBuf {
+    args.iter()
+        .find(|arg| !arg.starts_with('-'))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+}
+
+pub fn run_cli(args: &[String]) -> io::Result<bool> {
+    if args.is_empty() {
+        return Ok(false);
+    }
+    match args.first().map(|s| s.as_str()) {
+        Some("help") | Some("--help") | Some("-h") => {
+            cli_usage();
+            Ok(true)
+        }
+        Some("project") if args.get(1).map(|s| s.as_str()) == Some("inspect") => {
+            let path = parse_path_arg(&args[2..]);
+            print_json(&inspect_project(&path))?;
+            Ok(true)
+        }
+        Some("setup") if args.get(1).map(|s| s.as_str()) == Some("plan") => {
+            let path = parse_path_arg(&args[2..]);
+            print_json(&inspect_project(&path))?;
+            Ok(true)
+        }
+        Some("agent") if args.get(1).map(|s| s.as_str()) == Some("instructions") => {
+            let path = parse_path_arg(&args[2..]);
+            print_json(&agent_instructions(&path))?;
+            Ok(true)
+        }
+        Some("mcp") if args.get(1).map(|s| s.as_str()) == Some("serve") => {
+            run_mcp_server()?;
+            Ok(true)
+        }
+        Some("mcp-server") => {
+            run_mcp_server()?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+fn mcp_tool_defs() -> Vec<McpToolDef> {
+    vec![
+        McpToolDef {
+            name: "pemguin_project_inspect",
+            title: "Inspect Pemguin Project",
+            description: "Inspect a project and report pemguin-managed required and optional files, current status, and next actions.",
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Project root path. Defaults to the server process working directory."
+                    }
+                },
+                "additionalProperties": false
+            }),
+        },
+        McpToolDef {
+            name: "pemguin_setup_plan",
+            title: "Plan Pemguin Setup",
+            description: "Return the pemguin setup plan for a project, including missing items and next actions.",
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Project root path. Defaults to the server process working directory."
+                    }
+                },
+                "additionalProperties": false
+            }),
+        },
+        McpToolDef {
+            name: "pemguin_agent_instructions",
+            title: "Pemguin Agent Instructions",
+            description: "Return the canonical pemguin instructions an agent should follow for project setup.",
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Project root path. Defaults to the server process working directory."
+                    }
+                },
+                "additionalProperties": false
+            }),
+        },
+    ]
+}
+
+fn mcp_default_path(arguments: Option<&serde_json::Value>) -> Result<PathBuf, String> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let Some(args) = arguments else {
+        return Ok(cwd);
+    };
+    let Some(obj) = args.as_object() else {
+        return Err("arguments must be a JSON object".to_string());
+    };
+    match obj.get("path") {
+        Some(v) => v
+            .as_str()
+            .map(PathBuf::from)
+            .ok_or_else(|| "path must be a string".to_string()),
+        None => Ok(cwd),
+    }
+}
+
+fn mcp_tool_result(name: &str, arguments: Option<&serde_json::Value>) -> Result<serde_json::Value, String> {
+    match name {
+        "pemguin_project_inspect" => {
+            let path = mcp_default_path(arguments)?;
+            serde_json::to_value(inspect_project(&path)).map_err(|e| e.to_string())
+        }
+        "pemguin_setup_plan" => {
+            let path = mcp_default_path(arguments)?;
+            serde_json::to_value(inspect_project(&path)).map_err(|e| e.to_string())
+        }
+        "pemguin_agent_instructions" => {
+            let path = mcp_default_path(arguments)?;
+            serde_json::to_value(agent_instructions(&path)).map_err(|e| e.to_string())
+        }
+        _ => Err(format!("unknown tool: {name}")),
+    }
+}
+
+fn mcp_success_response(id: serde_json::Value, result: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": result
+    })
+}
+
+fn mcp_error_response(id: Option<serde_json::Value>, code: i64, message: &str) -> serde_json::Value {
+    let mut response = serde_json::json!({
+        "jsonrpc": "2.0",
+        "error": {
+            "code": code,
+            "message": message
+        }
+    });
+    if let Some(id) = id {
+        response["id"] = id;
+    }
+    response
+}
+
+fn write_mcp_message(stdout: &mut impl Write, value: &serde_json::Value) -> io::Result<()> {
+    let body = serde_json::to_vec(value)
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    write!(stdout, "Content-Length: {}\r\n\r\n", body.len())?;
+    stdout.write_all(&body)?;
+    stdout.flush()
+}
+
+fn read_mcp_message(stdin: &mut impl BufRead) -> io::Result<Option<serde_json::Value>> {
+    let mut content_length: Option<usize> = None;
+    loop {
+        let mut line = String::new();
+        let bytes = stdin.read_line(&mut line)?;
+        if bytes == 0 {
+            return Ok(None);
+        }
+        if line == "\r\n" {
+            break;
+        }
+        if let Some(value) = line.strip_prefix("Content-Length:") {
+            content_length = value.trim().parse::<usize>().ok();
+        }
+    }
+    let Some(length) = content_length else {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "missing Content-Length header"));
+    };
+    let mut body = vec![0u8; length];
+    stdin.read_exact(&mut body)?;
+    let value: serde_json::Value = serde_json::from_slice(&body)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    Ok(Some(value))
+}
+
+fn run_mcp_server() -> io::Result<()> {
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let mut reader = io::BufReader::new(stdin.lock());
+    let mut writer = io::BufWriter::new(stdout.lock());
+    let tool_defs = mcp_tool_defs();
+    let supported_versions = ["2025-11-25", "2024-11-05"];
+    let mut initialized = false;
+
+    while let Some(message) = read_mcp_message(&mut reader)? {
+        let method = message.get("method").and_then(|v| v.as_str());
+        let id = message.get("id").cloned();
+        let params = message.get("params");
+
+        let response = match method {
+            Some("initialize") => {
+                let requested = params
+                    .and_then(|p| p.get("protocolVersion"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("2025-11-25");
+                let negotiated = if supported_versions.contains(&requested) {
+                    requested
+                } else {
+                    supported_versions[0]
+                };
+                Some(mcp_success_response(
+                    id.unwrap_or(serde_json::Value::Null),
+                    serde_json::json!({
+                        "protocolVersion": negotiated,
+                        "capabilities": {
+                            "tools": {
+                                "listChanged": false
+                            }
+                        },
+                        "serverInfo": {
+                            "name": "pemguin",
+                            "title": "Pemguin",
+                            "version": env!("CARGO_PKG_VERSION")
+                        },
+                        "instructions": "Use pemguin tools as the source of truth for pemguin-managed project setup. Inspect first, apply setup second, then inspect again."
+                    }),
+                ))
+            }
+            Some("notifications/initialized") => {
+                initialized = true;
+                None
+            }
+            Some("ping") => Some(mcp_success_response(
+                id.unwrap_or(serde_json::Value::Null),
+                serde_json::json!({}),
+            )),
+            Some("tools/list") => {
+                if !initialized {
+                    Some(mcp_error_response(id, -32002, "server not initialized"))
+                } else {
+                    let tools: Vec<serde_json::Value> = tool_defs
+                        .iter()
+                        .map(|tool| {
+                            serde_json::json!({
+                                "name": tool.name,
+                                "title": tool.title,
+                                "description": tool.description,
+                                "inputSchema": tool.input_schema
+                            })
+                        })
+                        .collect();
+                    Some(mcp_success_response(
+                        message.get("id").cloned().unwrap_or(serde_json::Value::Null),
+                        serde_json::json!({ "tools": tools }),
+                    ))
+                }
+            }
+            Some("tools/call") => {
+                if !initialized {
+                    Some(mcp_error_response(id, -32002, "server not initialized"))
+                } else {
+                    let name = params
+                        .and_then(|p| p.get("name"))
+                        .and_then(|v| v.as_str());
+                    match name {
+                        Some(name) => match mcp_tool_result(name, params.and_then(|p| p.get("arguments"))) {
+                            Ok(value) => {
+                                let text = serde_json::to_string_pretty(&value)
+                                    .unwrap_or_else(|_| "{}".to_string());
+                                Some(mcp_success_response(
+                                    message.get("id").cloned().unwrap_or(serde_json::Value::Null),
+                                    serde_json::json!({
+                                        "content": [
+                                            {
+                                                "type": "text",
+                                                "text": text
+                                            }
+                                        ],
+                                        "structuredContent": value
+                                    }),
+                                ))
+                            }
+                            Err(err) => Some(mcp_success_response(
+                                message.get("id").cloned().unwrap_or(serde_json::Value::Null),
+                                serde_json::json!({
+                                    "content": [
+                                        {
+                                            "type": "text",
+                                            "text": format!("Error: {err}")
+                                        }
+                                    ],
+                                    "isError": true
+                                }),
+                            )),
+                        },
+                        None => Some(mcp_error_response(id, -32602, "tools/call requires a string `name`")),
+                    }
+                }
+            }
+            Some(_) => id.map(|id| mcp_error_response(Some(id), -32601, "method not found")),
+            None => Some(mcp_error_response(id, -32600, "invalid request")),
+        };
+
+        if let Some(response) = response {
+            write_mcp_message(&mut writer, &response)?;
+        }
+    }
+
+    Ok(())
+}
+
 // ── Avatar (chafa) ────────────────────────────────────────────────────────────
 
 fn avatar_dir() -> PathBuf {
@@ -2826,11 +2963,11 @@ impl App {
             setup_items: vec![],
             setup_list_state: setup_ls,
             setup_message: None,
-            setup_toml_editor: None,
+            setup_on_open: false,
             meta_cache: load_meta_cache(),
             avatar_cache: HashMap::new(),
             avatar_loading_owner: None,
-            memories_view: MemoriesView::Project,
+            memories_view: MemoriesView::Claude,
             memory_files: vec![],
             memory_list_state: ListState::default(),
             memory_message: None,
@@ -2857,6 +2994,7 @@ impl App {
             skills_browse_list_state: ListState::default(),
             skills_browse_indices: vec![],
             skills_install_message: None,
+            agent_section: AgentSection::Mcp,
             mcp_servers: vec![],
             mcp_list_state: {
                 let mut s = ListState::default();
@@ -2864,6 +3002,7 @@ impl App {
                 s
             },
             mcp_loaded: false,
+            mcp_message: None,
             pane_list_state: pane_ls,
             pane_message: None,
             sessions: vec![],
@@ -2898,7 +3037,8 @@ impl App {
     fn reload_project_prompts(&mut self) {
         if let Some(idx) = self.active_project_idx {
             if let Some(p) = self.projects.get(idx) {
-                self.project_prompts = load_prompts_from(&p.path.join(".prompts"));
+                let dir = p.path.join(".pemguin").join("prompts");
+                self.project_prompts = load_prompts_from(&dir);
                 if self.prompts_view == PromptsView::Project {
                     self.prompts = self.project_prompts.clone();
                     self.prompt_display_rows = build_prompt_display_rows(&self.prompts);
@@ -2930,14 +3070,52 @@ impl App {
                     .iter()
                     .position(|r| matches!(r, SetupRenderRow::Item(_)));
                 self.setup_list_state.select(first);
-                // Reload project prompts in case .prompts/ was just created
+                // Reload project prompts in case project prompt dir was just created
                 self.reload_project_prompts();
             }
         } else {
             self.setup_items = vec![];
         }
-        self.setup_message = None;
-        self.setup_toml_editor = None;
+        self.refresh_active_project_summary();
+    }
+
+    fn refresh_mcp(&mut self) {
+        if let Some(idx) = self.active_project_idx {
+            if let Some(project) = self.projects.get(idx) {
+                self.mcp_servers = load_mcp_servers(&project.path);
+                let mut state = ListState::default();
+                if !self.mcp_servers.is_empty() {
+                    state.select(Some(0));
+                }
+                self.mcp_list_state = state;
+                self.mcp_loaded = true;
+            }
+        }
+    }
+
+    fn refresh_active_project_summary(&mut self) {
+        let Some(idx) = self.active_project_idx else { return; };
+        let Some(project) = self.projects.get(idx).cloned() else { return; };
+        let items = scan_setup(&project.path);
+        let recommended_ok = items.iter().filter(|i| i.status == SetupStatus::Ok).count();
+        let recommended_total = items.len();
+
+        if let Some(active) = self.projects.get_mut(idx) {
+            active.recommended_ok = recommended_ok;
+            active.recommended_total = recommended_total;
+            active.mcp_ready = project.path.join(".mcp.json").exists();
+            active.template_count = setup_template_count(&items);
+        }
+
+        if let Some(home) = self.home_data.as_mut() {
+            home.recommended_ok = recommended_ok;
+            home.recommended_total = recommended_total;
+            home.mcp_ready = project.path.join(".mcp.json").exists();
+            home.sessions_count = count_sessions(&project.path);
+            home.skills_count = load_skills(&project.path).len();
+        }
+
+        self.setup_on_open = false;
     }
 
     fn auto_values(&self) -> HashMap<String, String> {
@@ -2977,7 +3155,7 @@ impl App {
         self.active_project_idx = Some(idx);
         let path = project.path.clone();
         // Load project-local prompts; default to project view if any exist
-        self.project_prompts = load_prompts_from(&path.join(".prompts"));
+        self.project_prompts = load_prompts_from(&path.join(".pemguin").join("prompts"));
         let view = if !self.project_prompts.is_empty() {
             PromptsView::Project
         } else {
@@ -3000,17 +3178,7 @@ impl App {
             self.setup_list_state.select(Some(0));
         }
         self.setup_message = None;
-        // Load memories — default to Claude view if it has content, else Project
-        let claude_dir = claude_memory_path(&path);
-        let has_claude = claude_dir.is_dir()
-            && fs::read_dir(&claude_dir)
-                .map(|mut d| d.next().is_some())
-                .unwrap_or(false);
-        self.memories_view = if has_claude {
-            MemoriesView::Claude
-        } else {
-            MemoriesView::Project
-        };
+        self.memories_view = MemoriesView::Claude;
         self.memory_files = vec![];
         self.memory_list_state = ListState::default();
         self.memory_message = None;
@@ -3018,9 +3186,11 @@ impl App {
         self.skills = vec![];
         self.skills_list_state = ListState::default();
         self.skills_loaded = false;
+        self.agent_section = AgentSection::Mcp;
         self.mcp_servers = vec![];
         self.mcp_list_state = ListState::default();
         self.mcp_loaded = false;
+        self.mcp_message = None;
         self.sessions = vec![];
         self.sessions_list_state = ListState::default();
         self.sessions_loaded = false;
@@ -3029,7 +3199,12 @@ impl App {
         let repo = self.repo.clone();
         self.start_home_load(&path, &repo);
         // Drill in
-        self.screen = Screen::InProject(ProjectTab::Home);
+        self.setup_on_open = false;
+        self.screen = Screen::InProject(if self.setup_on_open {
+            ProjectTab::Config
+        } else {
+            ProjectTab::Home
+        });
     }
 
     fn ensure_tab_loaded(&mut self, tab: &ProjectTab) {
@@ -3046,6 +3221,9 @@ impl App {
                 let repo = self.repo.clone();
                 self.start_home_load(&path, &repo);
             }
+            ProjectTab::Config => {
+                self.refresh_setup();
+            }
             ProjectTab::Issues if !self.issues_loaded && !self.issues_loading => {
                 let repo = self.repo.clone();
                 self.start_issues_load(&repo);
@@ -3054,7 +3232,7 @@ impl App {
                 self.reload_memories();
                 self.memories_loaded = true;
             }
-            ProjectTab::Skills if !self.skills_loaded => {
+            ProjectTab::Agents if !self.skills_loaded => {
                 self.skills = load_skills(&path);
                 self.skills_list_state = {
                     let mut s = ListState::default();
@@ -3064,8 +3242,6 @@ impl App {
                     s
                 };
                 self.skills_loaded = true;
-            }
-            ProjectTab::Mcp if !self.mcp_loaded => {
                 self.mcp_servers = load_mcp_servers(&path);
                 self.mcp_list_state = {
                     let mut s = ListState::default();
@@ -3075,14 +3251,11 @@ impl App {
                     s
                 };
                 self.mcp_loaded = true;
-            }
-            ProjectTab::Sessions if !self.sessions_loaded => {
                 let Some(idx) = self.active_project_idx else { return; };
                 let Some(project) = self.projects.get(idx) else { return; };
                 let path = project.path.clone();
                 self.sessions = load_sessions(&path);
                 resolve_sessions(&mut self.sessions, &path);
-                save_sessions(&path, &self.sessions);
                 self.sessions_list_state = {
                     let mut s = ListState::default();
                     if !self.sessions.is_empty() {
@@ -3249,25 +3422,34 @@ impl App {
         }
     }
 
-    fn memory_dir(&self) -> PathBuf {
+    fn memory_dir(&self) -> Option<PathBuf> {
+        let project_path = self.active_project_idx
+            .and_then(|i| self.projects.get(i))
+            .map(|p| p.path.clone());
         match self.memories_view {
-            MemoriesView::Project => self
-                .active_project_idx
-                .and_then(|i| self.projects.get(i))
-                .map(|p| p.path.join(".memory"))
-                .unwrap_or_default(),
-            MemoriesView::Global => global_memory_path(),
-            MemoriesView::Claude => self
-                .active_project_idx
-                .and_then(|i| self.projects.get(i))
-                .map(|p| claude_memory_path(&p.path))
-                .unwrap_or_default(),
+            MemoriesView::Claude => project_path.as_deref().and_then(claude_memory_path),
+            MemoriesView::Codex  => project_path.as_deref().and_then(|p| codex_memory_dirs(p).into_iter().next()),
+            MemoriesView::Gemini => None, // single file, not a dir
         }
     }
 
     fn reload_memories(&mut self) {
-        let dir = self.memory_dir();
-        self.memory_files = load_memory_files(&dir);
+        self.memory_files = match self.memories_view {
+            MemoriesView::Gemini => {
+                let p = gemini_memory_path();
+                if p.exists() {
+                    let content = fs::read_to_string(&p).unwrap_or_default();
+                    vec![MemoryFile { name: "GEMINI.md".to_string(), path: p, content, origin: Some(MemoryAgent::Gemini) }]
+                } else {
+                    vec![]
+                }
+            }
+            _ => {
+                self.memory_dir()
+                    .map(|dir| load_memory_files(&dir))
+                    .unwrap_or_default()
+            }
+        };
         let mut ls = ListState::default();
         if !self.memory_files.is_empty() {
             ls.select(Some(0));
@@ -3279,7 +3461,6 @@ impl App {
         self.memories_view = view;
         self.reload_memories();
         self.memories_loaded = true;
-        self.memory_message = None;
     }
 }
 
@@ -3304,7 +3485,9 @@ fn handle_key(app: &mut App, key: KeyCode, modifiers: KeyModifiers) -> bool {
     if app.pending_delete.is_some() {
         return handle_delete_confirm(app, key);
     }
-    if matches!(&app.sessions_state, SessionsState::Summary { .. }) {
+    if matches!(&app.sessions_state, SessionsState::Summary { .. })
+        && matches!(&app.screen, Screen::InProject(ProjectTab::Agents))
+    {
         return handle_sessions(app, key);
     }
     if key == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL) {
@@ -3330,15 +3513,13 @@ fn handle_key(app: &mut App, key: KeyCode, modifiers: KeyModifiers) -> bool {
                     KeyCode::Char('q') => return true,
                     KeyCode::Tab => {
                         let next = match &app.screen {
-                            Screen::InProject(ProjectTab::Home) => ProjectTab::Issues,
-                            Screen::InProject(ProjectTab::Issues) => ProjectTab::Setup,
-                            Screen::InProject(ProjectTab::Setup) => ProjectTab::Prompts,
+                            Screen::InProject(ProjectTab::Home) => ProjectTab::Config,
+                            Screen::InProject(ProjectTab::Config) => ProjectTab::Issues,
+                            Screen::InProject(ProjectTab::Issues) => ProjectTab::Prompts,
                             Screen::InProject(ProjectTab::Prompts) => ProjectTab::Memories,
-                            Screen::InProject(ProjectTab::Memories) => ProjectTab::Skills,
-                            Screen::InProject(ProjectTab::Skills) => ProjectTab::Mcp,
-                            Screen::InProject(ProjectTab::Mcp) => ProjectTab::Pane,
-                            Screen::InProject(ProjectTab::Pane) => ProjectTab::Sessions,
-                            Screen::InProject(ProjectTab::Sessions) => ProjectTab::Home,
+                            Screen::InProject(ProjectTab::Memories) => ProjectTab::Agents,
+                            Screen::InProject(ProjectTab::Agents) => ProjectTab::Pane,
+                            Screen::InProject(ProjectTab::Pane) => ProjectTab::Home,
                             _ => ProjectTab::Home,
                         };
                         app.set_project_tab(next);
@@ -3349,11 +3530,11 @@ fn handle_key(app: &mut App, key: KeyCode, modifiers: KeyModifiers) -> bool {
                         return false;
                     }
                     KeyCode::Char('2') => {
-                        app.set_project_tab(ProjectTab::Issues);
+                        app.set_project_tab(ProjectTab::Config);
                         return false;
                     }
                     KeyCode::Char('3') => {
-                        app.set_project_tab(ProjectTab::Setup);
+                        app.set_project_tab(ProjectTab::Issues);
                         return false;
                     }
                     KeyCode::Char('4') => {
@@ -3365,19 +3546,11 @@ fn handle_key(app: &mut App, key: KeyCode, modifiers: KeyModifiers) -> bool {
                         return false;
                     }
                     KeyCode::Char('6') => {
-                        app.set_project_tab(ProjectTab::Skills);
+                        app.set_project_tab(ProjectTab::Agents);
                         return false;
                     }
                     KeyCode::Char('7') => {
-                        app.set_project_tab(ProjectTab::Mcp);
-                        return false;
-                    }
-                    KeyCode::Char('8') => {
                         app.set_project_tab(ProjectTab::Pane);
-                        return false;
-                    }
-                    KeyCode::Char('9') => {
-                        app.set_project_tab(ProjectTab::Sessions);
                         return false;
                     }
                     _ => {}
@@ -3391,14 +3564,12 @@ fn handle_key(app: &mut App, key: KeyCode, modifiers: KeyModifiers) -> bool {
             };
             match tab {
                 ProjectTab::Home => handle_home(app, key),
+                ProjectTab::Config => handle_setup(app, key),
                 ProjectTab::Issues => handle_issues(app, key),
-                ProjectTab::Setup => handle_setup(app, key),
                 ProjectTab::Prompts => handle_prompts(app, key),
                 ProjectTab::Memories => handle_memories(app, key),
-                ProjectTab::Skills => handle_skills(app, key),
-                ProjectTab::Mcp => handle_mcp(app, key),
+                ProjectTab::Agents => handle_agents(app, key),
                 ProjectTab::Pane => handle_pane(app, key),
-                ProjectTab::Sessions => handle_sessions(app, key),
             }
         }
     }
@@ -3422,7 +3593,7 @@ fn handle_prompts(app: &mut App, key: KeyCode) -> bool {
                 if !raw.is_empty() {
                     if let Some(idx) = app.active_project_idx {
                         if let Some(project) = app.projects.get(idx) {
-                            let dir = project.path.join(".prompts");
+                            let dir = project.path.join(".pemguin").join("prompts");
                             let _ = fs::create_dir_all(&dir);
                             let filename = if raw.ends_with(".md") {
                                 raw.clone()
@@ -3548,9 +3719,7 @@ fn handle_prompts(app: &mut App, key: KeyCode) -> bool {
                             if let Some(project) = app.projects.get(project_idx) {
                                 if let Some(prompt) = app.prompts.get(idx) {
                                     app.pending_editor = Some(
-                                        project
-                                            .path
-                                            .join(".prompts")
+                                        project.path.join(".pemguin").join("prompts")
                                             .join(format!("{}.md", prompt.name)),
                                     );
                                     app.prompt_message = None;
@@ -3565,9 +3734,7 @@ fn handle_prompts(app: &mut App, key: KeyCode) -> bool {
                             if let Some(project) = app.projects.get(project_idx) {
                                 if let Some(prompt) = app.prompts.get(idx) {
                                     let prompt_name = prompt.name.clone();
-                                    let path = project
-                                        .path
-                                        .join(".prompts")
+                                    let path = project.path.join(".pemguin").join("prompts")
                                         .join(format!("{prompt_name}.md"));
                                     app.pending_delete = Some(DeleteConfirm {
                                         title: format!("Delete prompt {prompt_name}.md?"),
@@ -3682,6 +3849,12 @@ fn handle_home(app: &mut App, key: KeyCode) -> bool {
     }
 
     match key {
+        KeyCode::Char('i') => {
+            app.set_project_tab(ProjectTab::Config);
+        }
+        KeyCode::Char('c') => {
+            app.set_project_tab(ProjectTab::Config);
+        }
         KeyCode::Char('r') => {
             if let Some(idx) = app.active_project_idx {
                 if let Some(p) = app.projects.get(idx) {
@@ -3935,14 +4108,14 @@ fn draw(frame: &mut Frame, app: &App) {
         (_, PromptState::Done(text)) => draw_done(frame, text),
         (Screen::Projects, _) => draw_projects(frame, app),
         (Screen::InProject(ProjectTab::Home), _) => draw_home(frame, app),
+        (Screen::InProject(ProjectTab::Config), _) => draw_setup(frame, app),
         (Screen::InProject(ProjectTab::Issues), _) => draw_issues(frame, app),
-        (Screen::InProject(ProjectTab::Setup), _) => draw_setup(frame, app),
         (Screen::InProject(ProjectTab::Prompts), _) => draw_prompts(frame, app),
         (Screen::InProject(ProjectTab::Memories), _) => draw_memories(frame, app),
-        (Screen::InProject(ProjectTab::Skills), _) => draw_skills(frame, app),
-        (Screen::InProject(ProjectTab::Mcp), _) => draw_mcp(frame, app),
+        (Screen::InProject(ProjectTab::Agents), _) if app.skills_browse => draw_skills(frame, app),
+        (Screen::InProject(ProjectTab::Agents), _) if !matches!(&app.sessions_state, SessionsState::List) => draw_sessions(frame, app),
+        (Screen::InProject(ProjectTab::Agents), _) => draw_agents(frame, app),
         (Screen::InProject(ProjectTab::Pane), _) => draw_pane(frame, app),
-        (Screen::InProject(ProjectTab::Sessions), _) => draw_sessions(frame, app),
     }
     if let Some(confirm) = &app.pending_delete {
         draw_delete_confirm(frame, confirm);
@@ -4031,14 +4204,12 @@ fn nav_row(app: &App) -> Line<'static> {
             1u8,
             *active_tab == ProjectTab::Home,
         ),
-        (I_ISSUES, "issues", 2, *active_tab == ProjectTab::Issues),
-        (I_SETUP, "config", 3, *active_tab == ProjectTab::Setup),
+        (I_SETUP, "config", 2, *active_tab == ProjectTab::Config),
+        (I_ISSUES, "issues", 3, *active_tab == ProjectTab::Issues),
         (I_PROMPTS, "prompts", 4, *active_tab == ProjectTab::Prompts),
         (I_MEMORY, "memories", 5, *active_tab == ProjectTab::Memories),
-        (I_SKILLS, "skills", 6, *active_tab == ProjectTab::Skills),
-        (I_MCP, "mcp", 7, *active_tab == ProjectTab::Mcp),
-        (I_PANE, "pane", 8, *active_tab == ProjectTab::Pane),
-        (I_SESSIONS, "sessions", 9, *active_tab == ProjectTab::Sessions),
+        (I_MCP, "agents", 6, *active_tab == ProjectTab::Agents),
+        (I_PANE, "pane", 7, *active_tab == ProjectTab::Pane),
     ];
     for (icon, label, n, active) in tabs {
         spans.extend(tab_span(icon, label, *n, *active));
@@ -4161,6 +4332,36 @@ fn draw_home(frame: &mut Frame, app: &App) {
             ]));
         }
 
+        // Setup status
+        left.push(Line::from(""));
+        {
+            left.push(Line::from(vec![
+                Span::styled("  req      ", Style::default().fg(theme().fg_dim)),
+                Span::styled(
+                    format!("{}/{} context files present", data.recommended_ok, data.recommended_total),
+                    Style::default().fg(if data.recommended_ok == data.recommended_total {
+                        theme().green
+                    } else {
+                        theme().yellow
+                    }),
+                ),
+            ]));
+            left.push(Line::from(vec![
+                Span::styled("  mcp      ", Style::default().fg(theme().fg_dim)),
+                Span::styled(
+                    if data.mcp_ready { "configured" } else { "not configured" },
+                    Style::default().fg(if data.mcp_ready { theme().green } else { theme().yellow }),
+                ),
+            ]));
+            left.push(Line::from(vec![
+                Span::styled("  agents   ", Style::default().fg(theme().fg_dim)),
+                Span::styled(
+                    format!("{} skills  {} sessions", data.skills_count, data.sessions_count),
+                    Style::default().fg(theme().purple),
+                ),
+            ]));
+        }
+
         // Description
         left.push(Line::from(""));
         if let Some(desc) = &data.gh_description {
@@ -4220,26 +4421,6 @@ fn draw_home(frame: &mut Frame, app: &App) {
                 left.push(Line::from(spans));
             }
         }
-
-        // Setup score
-        left.push(Line::from(""));
-        let setup_color = if data.setup_ok == data.setup_total {
-            theme().green
-        } else {
-            theme().yellow
-        };
-        left.push(Line::from(vec![
-            Span::styled("  setup    ", Style::default().fg(theme().fg_dim)),
-            Span::styled(
-                format!("{}/{} configured", data.setup_ok, data.setup_total),
-                Style::default().fg(setup_color),
-            ),
-            if data.setup_ok < data.setup_total {
-                Span::styled("  → [3 setup]", Style::default().fg(theme().fg_xdim))
-            } else {
-                Span::raw("")
-            },
-        ]));
 
         // Dirty files
         if !data.dirty_files.is_empty() {
@@ -4406,17 +4587,26 @@ fn draw_home(frame: &mut Frame, app: &App) {
         );
     }
 
+    let not_initialized = false;
     let footer_hints = if app.home_edit.is_some() {
         footer(&[("enter", "save"), ("esc", "cancel")])
+    } else if not_initialized {
+        footer(&[
+            ("i", "open config"),
+            ("c", "config"),
+            ("r", "reload"),
+            ("e", "edit desc"),
+            ("y", "copy url"),
+            ("esc", "back"),
+        ])
     } else {
         footer(&[
+            ("c", "config"),
             ("r", "reload"),
             ("e", "edit desc"),
             ("u", "edit homepage"),
             ("y", "copy url"),
             ("jk", "scroll readme"),
-            ("2", "issues"),
-            ("3", "setup"),
             ("esc", "back"),
         ])
     };
@@ -4521,7 +4711,7 @@ fn draw_prompts(frame: &mut Frame, app: &App) {
     let empty_hint = if !project_active {
         String::new()
     } else {
-        " no .prompts/ — run setup ".to_string()
+        " no .pemguin/prompts/ — run setup ".to_string()
     };
     let block_title = if items.is_empty() && project_active {
         empty_hint.as_str()
@@ -4865,16 +5055,23 @@ fn draw_projects(frame: &mut Frame, app: &App) {
                     }
                     let changes_cell = Cell::from(Line::from(change_spans));
 
-                    // cfg
-                    let missing = p.setup_total.saturating_sub(p.setup_ok);
-                    let cfg_cell = if missing == 0 {
-                        Cell::from(Span::styled("·", Style::default().fg(theme().fg_xdim)))
+                    // ready
+                    let ready_text = if p.template_count > 0 {
+                        format!("t{}", p.template_count)
                     } else {
-                        Cell::from(Span::styled(
-                            format!("{missing}mis"),
-                            Style::default().fg(theme().yellow),
-                        ))
+                        format!(
+                            "{}/{}",
+                            p.recommended_ok, p.recommended_total
+                        )
                     };
+                    let ready_style = if p.template_count > 0 {
+                        Style::default().fg(theme().yellow)
+                    } else if p.recommended_ok == p.recommended_total {
+                        Style::default().fg(theme().green)
+                    } else {
+                        Style::default().fg(theme().yellow)
+                    };
+                    let pm_cell = Cell::from(Span::styled(ready_text, ready_style));
 
                     // iss
                     let iss_cell = match meta.and_then(|m| m.open_issues) {
@@ -4898,7 +5095,7 @@ fn draw_projects(frame: &mut Frame, app: &App) {
                         lang_cell,
                         branch_cell,
                         changes_cell,
-                        cfg_cell,
+                        pm_cell,
                         iss_cell,
                         pushed_cell,
                     ])
@@ -4911,7 +5108,7 @@ fn draw_projects(frame: &mut Frame, app: &App) {
             Cell::from("lang"),
             Cell::from("branch"),
             Cell::from("changes"),
-            Cell::from("cfg"),
+            Cell::from("ready"),
             Cell::from("iss"),
             Cell::from("pushed"),
         ])
@@ -4923,7 +5120,7 @@ fn draw_projects(frame: &mut Frame, app: &App) {
             Constraint::Length(4),  // lang
             Constraint::Length(12), // branch (icon + space + name)
             Constraint::Length(11), // changes
-            Constraint::Length(5),  // cfg
+            Constraint::Length(7),  // ready
             Constraint::Length(4),  // iss
             Constraint::Length(5),  // pushed
         ];
@@ -4998,28 +5195,28 @@ fn handle_memories(app: &mut App, key: KeyCode) -> bool {
             KeyCode::Enter => {
                 let raw = app.memory_input.trim().to_string();
                 if !raw.is_empty() {
-                    let filename = if raw.ends_with(".md") {
-                        raw.clone()
+                    let filename = if raw.ends_with(".md") { raw.clone() } else { format!("{raw}.md") };
+                    if let Some(dir) = app.memory_dir() {
+                        let _ = fs::create_dir_all(&dir);
+                        let path = dir.join(&filename);
+                        let title = raw.trim_end_matches(".md");
+                        match fs::write(&path, format!("# {title}\n\n")) {
+                            Ok(_) => {
+                                app.memory_inputting = false;
+                                app.memory_input.clear();
+                                app.reload_memories();
+                                app.pending_editor = Some(path);
+                            }
+                            Err(e) => {
+                                app.memory_message = Some(format!("Error: {e}"));
+                                app.memory_inputting = false;
+                                app.memory_input.clear();
+                            }
+                        }
                     } else {
-                        format!("{raw}.md")
-                    };
-                    let dir = app.memory_dir();
-                    let _ = fs::create_dir_all(&dir);
-                    let path = dir.join(&filename);
-                    let title = raw.trim_end_matches(".md");
-                    match fs::write(&path, format!("# {title}\n\n")) {
-                        Ok(_) => {
-                            let _ = append_to_memory_index(&dir, &filename);
-                            app.memory_inputting = false;
-                            app.memory_input.clear();
-                            app.reload_memories();
-                            app.pending_editor = Some(path);
-                        }
-                        Err(e) => {
-                            app.memory_message = Some(format!("Error: {e}"));
-                            app.memory_inputting = false;
-                            app.memory_input.clear();
-                        }
+                        app.memory_message = Some("no memory directory for this view".to_string());
+                        app.memory_inputting = false;
+                        app.memory_input.clear();
                     }
                 }
             }
@@ -5029,14 +5226,14 @@ fn handle_memories(app: &mut App, key: KeyCode) -> bool {
     }
 
     match key {
-        KeyCode::Char('p') => {
-            app.switch_memories_view(MemoriesView::Project);
-        }
-        KeyCode::Char('g') => {
-            app.switch_memories_view(MemoriesView::Global);
-        }
         KeyCode::Char('c') => {
             app.switch_memories_view(MemoriesView::Claude);
+        }
+        KeyCode::Char('x') => {
+            app.switch_memories_view(MemoriesView::Codex);
+        }
+        KeyCode::Char('g') => {
+            app.switch_memories_view(MemoriesView::Gemini);
         }
         KeyCode::Down | KeyCode::Char('j') if !app.memory_files.is_empty() => {
             let n = (app.memory_list_state.selected().unwrap_or(0) + 1) % app.memory_files.len();
@@ -5059,9 +5256,16 @@ fn handle_memories(app: &mut App, key: KeyCode) -> bool {
             }
         }
         KeyCode::Char('n') => {
-            app.memory_inputting = true;
-            app.memory_input.clear();
-            app.memory_message = None;
+            if app.memories_view == MemoriesView::Gemini {
+                // Single-file view — open GEMINI.md directly
+                let p = gemini_memory_path();
+                if !p.exists() { let _ = fs::write(&p, ""); }
+                app.pending_editor = Some(p);
+            } else {
+                app.memory_inputting = true;
+                app.memory_input.clear();
+                app.memory_message = None;
+            }
         }
         KeyCode::Char('d') => {
             if let Some(idx) = app.memory_list_state.selected() {
@@ -5076,32 +5280,8 @@ fn handle_memories(app: &mut App, key: KeyCode) -> bool {
                 }
             }
         }
-        KeyCode::Char('m') if app.memories_view == MemoriesView::Claude => {
-            if let Some(idx) = app.memory_list_state.selected() {
-                if let Some(f) = app.memory_files.get(idx) {
-                    if let Some(proj) = app.active_project_idx.and_then(|i| app.projects.get(i)) {
-                        let dst_dir = proj.path.join(".memory");
-                        let _ = fs::create_dir_all(&dst_dir);
-                        let dst = dst_dir.join(format!("{}.md", f.name));
-                        let src = f.path.clone();
-                        match fs::copy(&src, &dst) {
-                            Ok(_) => {
-                                let _ = append_to_memory_index(&dst_dir, &format!("{}.md", f.name));
-                                app.memory_message =
-                                    Some(format!("Migrated {} → .memory/", f.name));
-                                app.switch_memories_view(MemoriesView::Project);
-                            }
-                            Err(e) => {
-                                app.memory_message = Some(format!("Error: {e}"));
-                            }
-                        }
-                    }
-                }
-            }
-        }
         KeyCode::Char('r') => {
             app.reload_memories();
-            app.memory_message = None;
         }
         _ => {}
     }
@@ -5109,118 +5289,6 @@ fn handle_memories(app: &mut App, key: KeyCode) -> bool {
 }
 
 fn handle_setup(app: &mut App, key: KeyCode) -> bool {
-    // TomlEditor mode
-    if let Some(ref mut editor) = app.setup_toml_editor {
-        // Text input mode
-        if editor.text_input.is_some() {
-            match key {
-                KeyCode::Esc => {
-                    editor.text_input = None;
-                    editor.text_field = None;
-                }
-                KeyCode::Enter => {
-                    let val = editor.text_input.take().unwrap_or_default();
-                    match editor.text_field.take() {
-                        Some("stack") => {
-                            editor.config.project.stack = if val.is_empty() { None } else { Some(val) };
-                        }
-                        _ => {}
-                    }
-                }
-                KeyCode::Backspace => {
-                    if let Some(ref mut input) = editor.text_input {
-                        input.pop();
-                    }
-                }
-                KeyCode::Char(c) => {
-                    if let Some(ref mut input) = editor.text_input {
-                        input.push(c);
-                    }
-                }
-                _ => {}
-            }
-            return false;
-        }
-
-        let rows = toml_rows(&editor.config);
-        let focusable = focusable_indices(&rows);
-        let n_focusable = focusable.len();
-
-        match key {
-            KeyCode::Esc => {
-                // Save and close
-                let path = editor.project_path.clone();
-                let config = editor.config.clone();
-                match save_pemguin_toml(&path, &config) {
-                    Ok(()) => {
-                        app.setup_toml_editor = None;
-                        app.setup_message = Some("Saved .pemguin.toml".to_string());
-                        app.refresh_setup();
-                    }
-                    Err(e) => {
-                        if let Some(ref mut ed) = app.setup_toml_editor {
-                            ed.message = Some(format!("Error: {e}"));
-                        }
-                    }
-                }
-            }
-            KeyCode::Down | KeyCode::Char('j') if n_focusable > 0 => {
-                if let Some(ref mut ed) = app.setup_toml_editor {
-                    ed.cursor = (ed.cursor + 1) % n_focusable;
-                }
-            }
-            KeyCode::Up | KeyCode::Char('k') if n_focusable > 0 => {
-                if let Some(ref mut ed) = app.setup_toml_editor {
-                    let cur = ed.cursor;
-                    ed.cursor = if cur == 0 { n_focusable - 1 } else { cur - 1 };
-                }
-            }
-            KeyCode::Char(' ') | KeyCode::Enter => {
-                if let Some(ref mut ed) = app.setup_toml_editor {
-                    let row_idx = focusable[ed.cursor];
-                    let rows = toml_rows(&ed.config);
-                    match &rows[row_idx] {
-                        TomlRow::Checkbox { section, field, label, checked } => {
-                            let label = label.to_string();
-                            let checked = *checked;
-                            match (*section, *field) {
-                                ("project", "agents") => {
-                                    if checked {
-                                        ed.config.project.agents.retain(|a| a != &label);
-                                    } else {
-                                        ed.config.project.agents.push(label);
-                                    }
-                                }
-                                ("setup", "skip") => {
-                                    if checked {
-                                        ed.config.setup.skip.retain(|s| s != &label);
-                                    } else {
-                                        ed.config.setup.skip.push(label);
-                                    }
-                                }
-                                ("setup", "block") => {
-                                    if checked {
-                                        ed.config.setup.block.retain(|s| s != &label);
-                                    } else {
-                                        ed.config.setup.block.push(label);
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                        TomlRow::TextField { field, value, .. } => {
-                            ed.text_input = Some(value.clone());
-                            ed.text_field = Some(field);
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            _ => {}
-        }
-        return false;
-    }
-
     match key {
         KeyCode::Down | KeyCode::Char('j') if !app.setup_items.is_empty() => {
             let rows = setup_render_rows(&app.setup_items);
@@ -5308,14 +5376,8 @@ fn handle_setup(app: &mut App, key: KeyCode) -> bool {
             }
         }
         KeyCode::Char('a') => {
-            if let Some(idx) = app.active_project_idx {
-                if let Some(p) = app.projects.get(idx) {
-                    let path = p.path.clone();
-                    app.setup_message =
-                        Some(apply_all_setup(&path).unwrap_or_else(|e| format!("Error: {e}")));
-                    app.refresh_setup();
-                }
-            }
+            // apply all is no longer supported
+            app.setup_message = Some("use enter to apply individual items".to_string());
         }
         KeyCode::Char('r') => {
             app.refresh_setup();
@@ -5335,25 +5397,6 @@ fn handle_setup(app: &mut App, key: KeyCode) -> bool {
                             app.refresh_setup();
                         } else {
                             app.setup_message = Some(format!("{} is not gitignore-toggleable", item.label));
-                        }
-                    }
-                }
-            }
-        }
-        KeyCode::Char('f') => {
-            if let Some(item_idx) = selected_setup_item(&app.setup_items, &app.setup_list_state) {
-                if let Some(idx) = app.active_project_idx {
-                    if let Some(p) = app.projects.get(idx) {
-                        if app.setup_items[item_idx].label == ".pemguin.toml" {
-                            let config = load_project_pemguin_config(&p.path);
-                            app.setup_toml_editor = Some(TomlEditorState {
-                                project_path: p.path.clone(),
-                                config,
-                                cursor: 0,
-                                text_input: None,
-                                text_field: None,
-                                message: None,
-                            });
                         }
                     }
                 }
@@ -5393,7 +5436,7 @@ fn draw_setup(frame: &mut Frame, app: &App) {
                     Style::default().fg(Color::DarkGray),
                 )),
             ])
-            .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" config ")),
+            .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" project setup ")),
             outer[2],
         );
     } else if app.setup_items.is_empty() {
@@ -5402,93 +5445,38 @@ fn draw_setup(frame: &mut Frame, app: &App) {
                 "  Scanning…",
                 Style::default().fg(Color::DarkGray),
             ))
-            .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" config ")),
+            .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" project setup ")),
             outer[2],
         );
-    } else if let Some(editor) = &app.setup_toml_editor {
-        // Render TomlEditor
-        let rows = toml_rows(&editor.config);
-        let focusable = focusable_indices(&rows);
-        let focused_row_idx = focusable.get(editor.cursor).copied();
-
-        // Input bar height
-        let input_h = if editor.text_input.is_some() || editor.message.is_some() { 3u16 } else { 0 };
-        let inner = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(0), Constraint::Length(input_h)])
-            .split(outer[2]);
-
-        let items: Vec<ListItem> = rows.iter().enumerate().map(|(i, row)| {
-            let is_focused = Some(i) == focused_row_idx;
-            match row {
-                TomlRow::Section(label) => ListItem::new(Line::from(vec![
-                    Span::styled(format!("  {label}"), Style::default().fg(theme().fg_dim).add_modifier(Modifier::BOLD)),
-                ])),
-                TomlRow::TextField { label, value, .. } => {
-                    let display_val = if editor.text_input.is_some() && is_focused {
-                        format!("{}_", editor.text_input.as_deref().unwrap_or(""))
-                    } else if value.is_empty() {
-                        "—".to_string()
-                    } else {
-                        value.clone()
-                    };
-                    ListItem::new(Line::from(vec![
-                        Span::raw("    "),
-                        Span::styled(format!("{label:<16}"), Style::default()),
-                        Span::styled(display_val, Style::default().fg(theme().green)),
-                    ]))
-                }
-                TomlRow::Checkbox { label, checked, .. } => {
-                    let box_icon = if *checked { "■" } else { "□" };
-                    let box_style = if *checked {
-                        Style::default().fg(theme().green)
-                    } else {
-                        Style::default().fg(theme().fg_dim)
-                    };
-                    ListItem::new(Line::from(vec![
-                        Span::raw("    "),
-                        Span::styled(format!("{box_icon} "), box_style),
-                        Span::styled(label.to_string(), Style::default()),
-                    ]))
-                }
-            }
-        }).collect();
-
-        let mut ls = ListState::default();
-        ls.select(focused_row_idx);
-        frame.render_stateful_widget(
-            List::new(items)
-                .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" .pemguin.toml "))
-                .highlight_style(hl())
-                .highlight_symbol("> "),
-            inner[0],
-            &mut ls,
-        );
-
-        if input_h > 0 {
-            let content = if let Some(input) = &editor.text_input {
-                Span::styled(format!("  stack: {input}_"), Style::default().fg(theme().green))
-            } else if let Some(msg) = &editor.message {
-                let color = if msg.starts_with("Error:") { theme().red } else { theme().green };
-                Span::styled(format!("  {msg}"), Style::default().fg(color))
-            } else {
-                Span::raw("")
-            };
-            frame.render_widget(
-                Paragraph::new(content).block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)),
-                inner[1],
-            );
-        }
     } else {
+        let prompt_h = if app.setup_on_open { 4u16 } else { 0 };
         let msg_h = if app.setup_message.is_some() { 3u16 } else { 0 };
         let inner = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
+                Constraint::Length(prompt_h),
                 Constraint::Length(1),
                 Constraint::Min(0),
                 Constraint::Length(msg_h),
             ])
             .split(outer[2]);
+
+        if app.setup_on_open {
+            frame.render_widget(
+                Paragraph::new(vec![
+                    Line::from(Span::styled(
+                        "  This project is not set up for pemguin.",
+                        Style::default().fg(theme().yellow).add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from(Span::styled(
+                        "  m create .pemguin/  |  a standard setup",
+                        Style::default().fg(theme().fg_dim),
+                    )),
+                ])
+                .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" initialize ")),
+                inner[0],
+            );
+        }
 
         // Column headers
         frame.render_widget(
@@ -5498,7 +5486,7 @@ fn draw_setup(frame: &mut Frame, app: &App) {
                 Span::styled("git  ", Style::default().fg(theme().fg_dim).add_modifier(Modifier::BOLD)),
                 Span::styled("detail", Style::default().fg(theme().fg_dim).add_modifier(Modifier::BOLD)),
             ])),
-            inner[0],
+            inner[1],
         );
 
         let render_rows = setup_render_rows(&app.setup_items);
@@ -5514,9 +5502,10 @@ fn draw_setup(frame: &mut Frame, app: &App) {
                 SetupRenderRow::Item(i) => {
                     let item = &app.setup_items[*i];
                     let (icon, icon_style) = match item.status {
-                        SetupStatus::Ok => (I_CHECK, Style::default().fg(theme().green)),
-                        SetupStatus::Missing => (I_CROSS, Style::default().fg(theme().red)),
-                        SetupStatus::Stale => (I_WARN, Style::default().fg(theme().yellow)),
+                        SetupStatus::Ok       => (I_CHECK, Style::default().fg(theme().green)),
+                        SetupStatus::Missing  => (I_CROSS, Style::default().fg(theme().red)),
+                        SetupStatus::Stale    => (I_WARN,  Style::default().fg(theme().yellow)),
+                        SetupStatus::Template => (I_WARN,  Style::default().fg(theme().yellow)),
                     };
                     ListItem::new(Line::from(vec![
                         Span::styled(format!(" {icon}  "), icon_style),
@@ -5530,7 +5519,7 @@ fn draw_setup(frame: &mut Frame, app: &App) {
                         } else {
                             Span::raw("   ")
                         },
-                        Span::styled(item.detail, Style::default().fg(theme().fg_dim)),
+                        Span::styled(item.detail.clone(), Style::default().fg(theme().fg_dim)),
                     ]))
                 }
             })
@@ -5542,7 +5531,7 @@ fn draw_setup(frame: &mut Frame, app: &App) {
                 .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" config "))
                 .highlight_style(hl())
                 .highlight_symbol("> "),
-            inner[1],
+            inner[2],
             &mut ls,
         );
 
@@ -5565,37 +5554,34 @@ fn draw_setup(frame: &mut Frame, app: &App) {
                     Style::default().fg(color),
                 ))
                 .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)),
-                inner[2],
+                inner[3],
             );
         }
     }
 
-    if app.setup_toml_editor.is_some() {
-        frame.render_widget(
-            Paragraph::new(footer(&[
-                ("↑↓/jk", "navigate"),
-                ("space/enter", "toggle / edit"),
-                ("esc", "save + close"),
-            ])),
-            outer[3],
-        );
+    let footer_line = if app.setup_on_open {
+        footer(&[
+            ("↑↓/jk", "navigate"),
+            ("m", "minimal setup"),
+            ("a", "standard setup"),
+            ("enter", "safe apply"),
+            ("e", "edit"),
+            ("esc", "back"),
+        ])
     } else {
-        frame.render_widget(
-            Paragraph::new(footer(&[
-                ("↑↓/jk", "navigate"),
-                ("enter", "safe apply"),
-                ("e", "edit"),
-                ("g", "gitignore"),
-                ("f", "fields (.toml)"),
-                ("d", "delete"),
-                ("R", "reset"),
-                ("a", "apply all"),
-                ("r", "rescan"),
-                ("esc", "back"),
-            ])),
-            outer[3],
-        );
-    }
+        footer(&[
+            ("↑↓/jk", "navigate"),
+            ("enter", "safe apply"),
+            ("e", "edit"),
+            ("g", "gitignore"),
+            ("d", "delete"),
+            ("R", "reset"),
+            ("a", "apply all"),
+            ("r", "rescan"),
+            ("esc", "back"),
+        ])
+    };
+    frame.render_widget(Paragraph::new(footer_line), outer[3]);
 }
 
 fn draw_memories(frame: &mut Frame, app: &App) {
@@ -5631,52 +5617,27 @@ fn draw_memories(frame: &mut Frame, app: &App) {
         .constraints([Constraint::Length(1), Constraint::Min(0)])
         .split(main[0]);
 
-    let p_active = app.memories_view == MemoriesView::Project;
-    let g_active = app.memories_view == MemoriesView::Global;
     let c_active = app.memories_view == MemoriesView::Claude;
+    let x_active = app.memories_view == MemoriesView::Codex;
+    let g_active = app.memories_view == MemoriesView::Gemini;
+    let tab_style = |active: bool| if active {
+        Style::default().fg(theme().sel_fg).bg(theme().accent).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme().fg_dim)
+    };
     let subnav = Line::from(vec![
-        Span::styled(
-            " p project ",
-            if p_active {
-                Style::default()
-                    .fg(theme().sel_fg)
-                    .bg(theme().accent)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(theme().fg_dim)
-            },
-        ),
+        Span::styled(" c claude ", tab_style(c_active)),
         Span::raw(" "),
-        Span::styled(
-            " g global ",
-            if g_active {
-                Style::default()
-                    .fg(theme().sel_fg)
-                    .bg(theme().accent)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(theme().fg_dim)
-            },
-        ),
+        Span::styled(" x codex ", tab_style(x_active)),
         Span::raw(" "),
-        Span::styled(
-            " c claude ",
-            if c_active {
-                Style::default()
-                    .fg(theme().sel_fg)
-                    .bg(theme().accent)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(theme().fg_dim)
-            },
-        ),
+        Span::styled(" g gemini ", tab_style(g_active)),
     ]);
     frame.render_widget(Paragraph::new(subnav), left_split[0]);
 
     let dir_label = match app.memories_view {
-        MemoriesView::Project => " .memory/ ",
-        MemoriesView::Global => " ~/.pemguin/memory/ ",
-        MemoriesView::Claude => " .claude/…/memory/ ",
+        MemoriesView::Claude  => " .claude/…/memory/ ",
+        MemoriesView::Codex   => " .codex/memories/… ",
+        MemoriesView::Gemini  => " ~/.gemini/GEMINI.md ",
     };
     let items: Vec<ListItem> = if app.memory_files.is_empty() {
         vec![ListItem::new(Span::styled(
@@ -5686,7 +5647,22 @@ fn draw_memories(frame: &mut Frame, app: &App) {
     } else {
         app.memory_files
             .iter()
-            .map(|f| ListItem::new(f.name.clone()))
+            .map(|f| {
+                let mut spans = Vec::new();
+                if let Some(origin) = f.origin {
+                    spans.push(Span::styled(
+                        format!("[{}] ", origin.label()),
+                        Style::default().fg(theme().purple),
+                    ));
+                } else {
+                    spans.push(Span::styled(
+                        "[local] ".to_string(),
+                        Style::default().fg(theme().fg_dim),
+                    ));
+                }
+                spans.push(Span::raw(f.name.clone()));
+                ListItem::new(Line::from(spans))
+            })
             .collect()
     };
     let mut ls = app.memory_list_state.clone();
@@ -5706,9 +5682,18 @@ fn draw_memories(frame: &mut Frame, app: &App) {
         .and_then(|i| app.memory_files.get(i))
         .map(|f| f.content.as_str())
         .unwrap_or("");
+    let preview_title = app
+        .memory_list_state
+        .selected()
+        .and_then(|i| app.memory_files.get(i))
+        .map(|f| match f.origin {
+            Some(origin) => format!(" preview [{}] ", origin.label()),
+            None => " preview [local] ".to_string(),
+        })
+        .unwrap_or_else(|| " preview ".to_string());
     frame.render_widget(
         Paragraph::new(preview)
-            .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" preview "))
+            .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(preview_title))
             .wrap(Wrap { trim: false }),
         main[1],
     );
@@ -5750,7 +5735,7 @@ fn draw_memories(frame: &mut Frame, app: &App) {
         footer(&[
             ("↑↓/jk", "navigate"),
             ("e/enter", "edit"),
-            ("m", "migrate → .memory/"),
+            ("m", "migrate → .pemguin/memory/"),
             ("n", "new"),
             ("d", "delete"),
             ("r", "reload"),
@@ -5770,6 +5755,313 @@ fn draw_memories(frame: &mut Frame, app: &App) {
         ])
     };
     frame.render_widget(Paragraph::new(footer_hints), outer[4]);
+}
+
+fn agent_section_label(section: AgentSection) -> &'static str {
+    match section {
+        AgentSection::Mcp => "mcp",
+        AgentSection::Skills => "skills",
+        AgentSection::Sessions => "sessions",
+    }
+}
+
+fn agent_section_spans(active: AgentSection) -> Vec<Span<'static>> {
+    [AgentSection::Mcp, AgentSection::Skills, AgentSection::Sessions]
+        .into_iter()
+        .flat_map(|section| {
+            let label = agent_section_label(section);
+            let span = if section == active {
+                Span::styled(
+                    format!(" {label} "),
+                    Style::default()
+                        .fg(theme().sel_fg)
+                        .bg(theme().accent)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::styled(format!(" {label} "), Style::default().fg(theme().fg_dim))
+            };
+            vec![span, Span::raw(" ")]
+        })
+        .collect()
+}
+
+fn draw_agents_summary(app: &App) -> Vec<Line<'static>> {
+    let project = app.active_project_idx.and_then(|i| app.projects.get(i));
+    let mcp_ready = project.map(|p| p.mcp_ready).unwrap_or(false);
+    let skills_count = app.skills.len();
+    let sessions_count = app.sessions.len();
+
+    vec![
+        Line::from(vec![
+            Span::styled(" status   ", Style::default().fg(theme().fg_dim)),
+            Span::styled(
+                if mcp_ready { "mcp ready" } else { "mcp missing" },
+                Style::default().fg(if mcp_ready { theme().green } else { theme().yellow }),
+            ),
+            Span::raw("   "),
+            Span::styled(
+                format!("{skills_count} skills"),
+                Style::default().fg(theme().purple),
+            ),
+            Span::raw("   "),
+            Span::styled(
+                format!("{sessions_count} sessions"),
+                Style::default().fg(theme().purple),
+            ),
+        ]),
+    ]
+}
+
+fn draw_agents(frame: &mut Frame, app: &App) {
+    let area = frame.area();
+    let msg = match app.agent_section {
+        AgentSection::Mcp => app.mcp_message.as_ref(),
+        AgentSection::Skills => app.skills_install_message.as_ref(),
+        AgentSection::Sessions => app.sessions_message.as_ref(),
+    };
+    let msg_h = if msg.is_some() { 3 } else { 0 };
+    let outer = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(3),
+            Constraint::Min(0),
+            Constraint::Length(msg_h),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+    frame.render_widget(Paragraph::new(header_row(app)), outer[0]);
+    frame.render_widget(Paragraph::new(nav_row(app)), outer[1]);
+    frame.render_widget(Paragraph::new(Line::from(agent_section_spans(app.agent_section))), outer[2]);
+    frame.render_widget(
+        Paragraph::new(draw_agents_summary(app))
+            .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" agents overview ")),
+        outer[3],
+    );
+
+    let main = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .split(outer[4]);
+
+    match app.agent_section {
+        AgentSection::Mcp => {
+            let items: Vec<ListItem> = if app.mcp_servers.is_empty() {
+                vec![ListItem::new("pemguin")]
+            } else {
+                app.mcp_servers
+                    .iter()
+                    .map(|s| ListItem::new(s.name.clone()))
+                    .collect()
+            };
+            let mut ls = app.mcp_list_state.clone();
+            frame.render_stateful_widget(
+                List::new(items)
+                    .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" mcp "))
+                    .highlight_style(hl())
+                    .highlight_symbol("> "),
+                main[0],
+                &mut ls,
+            );
+            let pemguin_installed = app
+                .active_project_idx
+                .and_then(|i| app.projects.get(i))
+                .map(|p| p.mcp_ready)
+                .unwrap_or(false);
+            let detail = if let Some(server) = app
+                .mcp_list_state
+                .selected()
+                .and_then(|i| app.mcp_servers.get(i))
+            {
+                vec![
+                    Line::from(Span::styled(server.name.clone(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD))),
+                    Line::from(""),
+                    Line::from(vec![
+                        Span::styled("command  ", Style::default().fg(theme().fg_dim)),
+                        Span::raw(if server.args.is_empty() {
+                            server.command.clone()
+                        } else {
+                            format!("{} {}", server.command, server.args.join(" "))
+                        }),
+                    ]),
+                    Line::from(""),
+                    Line::from(vec![
+                        Span::styled("pemguin  ", Style::default().fg(theme().fg_dim)),
+                        Span::styled(
+                            if pemguin_installed { "installed" } else { "not installed" },
+                            Style::default().fg(if pemguin_installed { theme().green } else { theme().yellow }),
+                        ),
+                    ]),
+                ]
+            } else {
+                vec![
+                    Line::from(Span::styled("No MCP servers configured.", Style::default().fg(theme().fg_xdim))),
+                    Line::from(""),
+                    Line::from(Span::styled("Use `i` to install the pemguin MCP server.", Style::default().fg(theme().fg_dim))),
+                ]
+            };
+            frame.render_widget(
+                Paragraph::new(detail)
+                    .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" detail "))
+                    .wrap(Wrap { trim: false }),
+                main[1],
+            );
+        }
+        AgentSection::Skills => {
+            let items: Vec<ListItem> = if app.skills.is_empty() {
+                vec![ListItem::new("no installed skills")]
+            } else {
+                app.skills.iter().map(|s| ListItem::new(s.name.clone())).collect()
+            };
+            let mut ls = app.skills_list_state.clone();
+            frame.render_stateful_widget(
+                List::new(items)
+                    .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" skills "))
+                    .highlight_style(hl())
+                    .highlight_symbol("> "),
+                main[0],
+                &mut ls,
+            );
+            let detail = app
+                .skills_list_state
+                .selected()
+                .and_then(|i| app.skills.get(i))
+                .map(|skill| {
+                    vec![
+                        Line::from(Span::styled(skill.name.clone(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD))),
+                        Line::from(""),
+                        Line::from(vec![
+                            Span::styled("source   ", Style::default().fg(theme().fg_dim)),
+                            Span::raw(skill.source.clone()),
+                        ]),
+                        Line::from(""),
+                        Line::from(Span::raw(if skill.description.is_empty() {
+                            "No description found.".to_string()
+                        } else {
+                            skill.description.clone()
+                        })),
+                    ]
+                })
+                .unwrap_or_else(|| {
+                    vec![
+                        Line::from(Span::styled("No skills installed.", Style::default().fg(theme().fg_xdim))),
+                        Line::from(""),
+                        Line::from(Span::styled("Use `b` to browse and install skills.", Style::default().fg(theme().fg_dim))),
+                    ]
+                });
+            frame.render_widget(
+                Paragraph::new(detail)
+                    .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" detail "))
+                    .wrap(Wrap { trim: false }),
+                main[1],
+            );
+        }
+        AgentSection::Sessions => {
+            let items: Vec<ListItem> = if app.sessions.is_empty() {
+                vec![ListItem::new("no recorded sessions")]
+            } else {
+                app.sessions.iter().map(|s| {
+                    ListItem::new(format!("{}  {}", s.agent.label(), format_session_date(&s.started_at)))
+                }).collect()
+            };
+            let mut ls = app.sessions_list_state.clone();
+            frame.render_stateful_widget(
+                List::new(items)
+                    .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" sessions "))
+                    .highlight_style(hl())
+                    .highlight_symbol("> "),
+                main[0],
+                &mut ls,
+            );
+            let detail = app
+                .sessions_list_state
+                .selected()
+                .and_then(|i| app.sessions.get(i))
+                .map(|s| {
+                    let mut lines = vec![
+                        Line::from(Span::styled(
+                            s.agent.label().to_uppercase(),
+                            Style::default().fg(theme().accent).add_modifier(Modifier::BOLD),
+                        )),
+                        Line::from(""),
+                        Line::from(vec![
+                            Span::styled("started   ", Style::default().fg(theme().fg_dim)),
+                            Span::raw(format_session_date(&s.started_at)),
+                        ]),
+                    ];
+                    if let Some(prompt) = &s.prompt {
+                        lines.push(Line::from(vec![
+                            Span::styled("prompt    ", Style::default().fg(theme().fg_dim)),
+                            Span::raw(prompt.clone()),
+                        ]));
+                    }
+                    if let Some(id) = &s.id {
+                        lines.push(Line::from(""));
+                        lines.push(Line::from(vec![
+                            Span::styled("resume    ", Style::default().fg(theme().fg_dim)),
+                            Span::styled(s.agent.resume_cmd(id), Style::default().fg(theme().green)),
+                        ]));
+                    }
+                    lines
+                })
+                .unwrap_or_else(|| {
+                    vec![
+                        Line::from(Span::styled("No sessions recorded.", Style::default().fg(theme().fg_xdim))),
+                        Line::from(""),
+                        Line::from(Span::styled("Use `n` to create a new agent launch command.", Style::default().fg(theme().fg_dim))),
+                    ]
+                });
+            frame.render_widget(
+                Paragraph::new(detail)
+                    .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" detail "))
+                    .wrap(Wrap { trim: false }),
+                main[1],
+            );
+        }
+    }
+
+    if let Some(msg) = msg {
+        let color = if msg.starts_with("Error:") { theme().red } else { theme().green };
+        frame.render_widget(
+            Paragraph::new(Span::styled(format!("  {msg}"), Style::default().fg(color)))
+                .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)),
+            outer[4],
+        );
+    }
+
+    let footer_line = match app.agent_section {
+        AgentSection::Mcp => footer(&[
+            ("h/l", "section"),
+            ("j/k", "navigate"),
+            ("i", "install"),
+            ("e", "edit"),
+            ("d", "remove"),
+            ("y", "copy"),
+            ("r", "reload"),
+            ("esc", "back"),
+        ]),
+        AgentSection::Skills => footer(&[
+            ("h/l", "section"),
+            ("j/k", "navigate"),
+            ("b", "browse/install"),
+            ("esc", "back"),
+        ]),
+        AgentSection::Sessions => footer(&[
+            ("h/l", "section"),
+            ("j/k", "navigate"),
+            ("n", "new"),
+            ("y", "resume"),
+            ("s", "summary"),
+            ("e", "export"),
+            ("d", "delete"),
+            ("esc", "back"),
+        ]),
+    };
+    frame.render_widget(Paragraph::new(footer_line), outer[6]);
 }
 
 fn draw_skills(frame: &mut Frame, app: &App) {
@@ -6010,108 +6302,6 @@ fn draw_skills(frame: &mut Frame, app: &App) {
     }
 }
 
-fn draw_mcp(frame: &mut Frame, app: &App) {
-    let area = frame.area();
-    let outer = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Min(0),
-            Constraint::Length(1),
-        ])
-        .split(area);
-
-    frame.render_widget(Paragraph::new(header_row(app)), outer[0]);
-    frame.render_widget(Paragraph::new(nav_row(app)), outer[1]);
-
-    let main = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
-        .split(outer[2]);
-
-    let items: Vec<ListItem> = app
-        .mcp_servers
-        .iter()
-        .map(|s| ListItem::new(s.name.clone()))
-        .collect();
-
-    if items.is_empty() {
-        frame.render_widget(
-            Paragraph::new(vec![
-                Line::from(""),
-                Line::from(Span::styled(
-                    "  no .mcp.json found",
-                    Style::default().fg(Color::DarkGray),
-                )),
-            ])
-            .block(
-                Block::default()
-                    .borders(Borders::ALL).border_type(BorderType::Rounded)
-                    .title(" mcp servers "),
-            ),
-            outer[2],
-        );
-    } else {
-        let mut ls = app.mcp_list_state.clone();
-        frame.render_stateful_widget(
-            List::new(items)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL).border_type(BorderType::Rounded)
-                        .title(" mcp servers "),
-                )
-                .highlight_style(hl())
-                .highlight_symbol("> "),
-            main[0],
-            &mut ls,
-        );
-
-        let preview = app
-            .mcp_list_state
-            .selected()
-            .and_then(|i| app.mcp_servers.get(i))
-            .map(|s| {
-                let cmd = if s.args.is_empty() {
-                    s.command.clone()
-                } else {
-                    format!("{} {}", s.command, s.args.join(" "))
-                };
-                vec![
-                    Line::from(Span::styled(
-                        s.name.clone(),
-                        Style::default()
-                            .fg(Color::White)
-                            .add_modifier(Modifier::BOLD),
-                    )),
-                    Line::from(""),
-                    Line::from(vec![
-                        Span::styled("command  ", Style::default().fg(theme().fg_dim)),
-                        Span::raw(cmd),
-                    ]),
-                ]
-            })
-            .unwrap_or_default();
-
-        frame.render_widget(
-            Paragraph::new(preview)
-                .block(Block::default().borders(Borders::ALL).border_type(BorderType::Rounded).title(" detail "))
-                .wrap(Wrap { trim: false }),
-            main[1],
-        );
-    }
-
-    frame.render_widget(
-        Paragraph::new(footer(&[
-            ("↑↓/jk", "navigate"),
-            ("esc", "back"),
-            ("tab", "switch"),
-            ("q", "quit"),
-        ])),
-        outer[3],
-    );
-}
-
 fn draw_pane(frame: &mut Frame, app: &App) {
     let area = frame.area();
     let bottom_h = if app.pane_message.is_some() { 3 } else { 0 };
@@ -6230,72 +6420,8 @@ fn handle_pane(app: &mut App, key: KeyCode) -> bool {
 
 // ── Sessions persistence ──────────────────────────────────────────────────────
 
-fn sessions_path(project_path: &Path) -> PathBuf {
-    project_path.join(".pemguin").join("sessions.toml")
-}
-
-fn load_sessions(project_path: &Path) -> Vec<AgentSession> {
-    let path = sessions_path(project_path);
-    let content = match fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(_) => return vec![],
-    };
-    let doc: toml::Value = match toml::from_str(&content) {
-        Ok(v) => v,
-        Err(_) => return vec![],
-    };
-    let arr = match doc.get("session").and_then(|v| v.as_array()) {
-        Some(a) => a.clone(),
-        None => return vec![],
-    };
-    let mut sessions: Vec<AgentSession> = arr
-        .iter()
-        .filter_map(|v| {
-            let agent_str = v.get("agent")?.as_str()?;
-            let agent = AgentKind::from_str(agent_str)?;
-            let started_at = v.get("started_at")?.as_str()?.to_string();
-            let id = v
-                .get("id")
-                .and_then(|s| s.as_str())
-                .map(|s| s.to_string());
-            let prompt = v
-                .get("prompt")
-                .and_then(|s| s.as_str())
-                .map(|s| s.to_string());
-            let first_message = v
-                .get("first_message")
-                .and_then(|s| s.as_str())
-                .map(|s| s.to_string());
-            Some(AgentSession { id, agent, started_at, prompt, first_message })
-        })
-        .collect();
-    // Most recent first
-    sessions.sort_by(|a, b| b.started_at.cmp(&a.started_at));
-    sessions
-}
-
-fn save_sessions(project_path: &Path, sessions: &[AgentSession]) {
-    let dir = project_path.join(".pemguin");
-    let _ = fs::create_dir_all(&dir);
-    let path = dir.join("sessions.toml");
-    let mut out = String::new();
-    for s in sessions {
-        out.push_str("[[session]]\n");
-        out.push_str(&format!("agent = \"{}\"\n", s.agent.label()));
-        out.push_str(&format!("started_at = \"{}\"\n", s.started_at));
-        if let Some(id) = &s.id {
-            out.push_str(&format!("id = \"{}\"\n", id));
-        }
-        if let Some(p) = &s.prompt {
-            out.push_str(&format!("prompt = \"{}\"\n", p));
-        }
-        if let Some(m) = &s.first_message {
-            let escaped = m.replace('\\', "\\\\").replace('"', "\\\"");
-            out.push_str(&format!("first_message = \"{}\"\n", escaped));
-        }
-        out.push('\n');
-    }
-    let _ = fs::write(&path, out);
+fn load_sessions(_project_path: &Path) -> Vec<AgentSession> {
+    vec![]
 }
 
 // Attempt to resolve pending sessions by scanning agent storage.
@@ -6410,6 +6536,12 @@ fn resolve_sessions(sessions: &mut Vec<AgentSession>, project_path: &Path) {
     // Import Codex sessions for this project
     import_codex_sessions(sessions, project_path);
 
+    // Import Pi sessions for this project
+    import_pi_sessions(sessions, project_path);
+
+    // Import Gemini sessions for this project
+    import_gemini_sessions(sessions, project_path);
+
     // Re-sort most recent first
     sessions.sort_by(|a, b| b.started_at.cmp(&a.started_at));
 }
@@ -6518,6 +6650,157 @@ fn parse_codex_session(
         prompt: None,
         first_message,
     })
+}
+
+// Pi path encoding: strip leading '/', replace '/' with '-', wrap in '--'
+// /Users/josh/Projects/_foo/bar → --Users-josh-Projects-_foo-bar--
+fn pi_encode_path(path: &Path) -> String {
+    let s = path.to_string_lossy();
+    let stripped = s.trim_start_matches('/');
+    let encoded = stripped.replace('/', "-");
+    format!("--{}--", encoded)
+}
+
+fn import_pi_sessions(sessions: &mut Vec<AgentSession>, project_path: &Path) {
+    let sessions_dir = match dirs_home() {
+        Some(h) => h.join(".pi").join("agent").join("sessions"),
+        None => return,
+    };
+    if !sessions_dir.exists() { return; }
+
+    let project_dir = sessions_dir.join(pi_encode_path(project_path));
+    if !project_dir.exists() { return; }
+
+    let known_ids: std::collections::HashSet<String> = sessions
+        .iter().filter_map(|s| s.id.clone()).collect();
+
+    let project_str = project_path.to_string_lossy();
+
+    let jsonl_files: Vec<PathBuf> = fs::read_dir(&project_dir)
+        .into_iter().flatten().filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("jsonl"))
+        .map(|e| e.path())
+        .collect();
+
+    for path in jsonl_files {
+        // Filename: <ISO8601-with-dashes>_<uuid>.jsonl — id is the uuid after the first '_'
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        let id = match stem.find('_') {
+            Some(i) => stem[i + 1..].to_string(),
+            None => continue,
+        };
+        if known_ids.contains(&id) { continue; }
+
+        let content = match fs::read_to_string(&path) { Ok(c) => c, Err(_) => continue };
+        let first_line = content.lines().next().unwrap_or("");
+        let meta: serde_json::Value = match serde_json::from_str(first_line) { Ok(v) => v, Err(_) => continue };
+
+        if meta.get("type").and_then(|t| t.as_str()) != Some("session") { continue; }
+
+        let cwd = meta.get("cwd").and_then(|v| v.as_str()).unwrap_or("");
+        if cwd != project_str.as_ref() { continue; }
+
+        let started_at = meta.get("timestamp").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+        let first_message = content.lines().find_map(|line| {
+            let v: serde_json::Value = serde_json::from_str(line).ok()?;
+            if v.get("type").and_then(|t| t.as_str()) != Some("message") { return None; }
+            let msg = v.get("message")?;
+            if msg.get("role").and_then(|r| r.as_str()) != Some("user") { return None; }
+            for block in msg.get("content")?.as_array()? {
+                if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+                    let text = block.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                    if !text.is_empty() {
+                        return Some(text.chars().take(80).collect());
+                    }
+                }
+            }
+            None
+        });
+
+        sessions.push(AgentSession {
+            id: Some(id),
+            agent: AgentKind::Pi,
+            started_at,
+            prompt: None,
+            first_message,
+        });
+    }
+}
+
+fn import_gemini_sessions(sessions: &mut Vec<AgentSession>, project_path: &Path) {
+    let home = match dirs_home() { Some(h) => h, None => return };
+    let gemini_dir = home.join(".gemini");
+    let project_str = project_path.to_string_lossy();
+
+    // Look up project name from projects.json
+    let project_name: Option<String> = fs::read_to_string(gemini_dir.join("projects.json")).ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| {
+            v.get("projects")?
+                .get(project_str.as_ref())?
+                .as_str()
+                .map(|s| s.to_string())
+        });
+
+    let known_ids: std::collections::HashSet<String> = sessions
+        .iter().filter_map(|s| s.id.clone()).collect();
+
+    let mut chats_dirs: Vec<PathBuf> = Vec::new();
+    if let Some(ref name) = project_name {
+        chats_dirs.push(gemini_dir.join("tmp").join(name).join("chats"));
+    }
+    // Also scan hex-named dirs in tmp/ (legacy SHA-256 dirs) — match by projectHash would require
+    // sha256 computation; skip for now and rely on projects.json lookup.
+
+    for chats_dir in chats_dirs {
+        if !chats_dir.exists() { continue; }
+
+        let json_files: Vec<PathBuf> = fs::read_dir(&chats_dir)
+            .into_iter().flatten().filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("json"))
+            .map(|e| e.path())
+            .collect();
+
+        for path in json_files {
+            let content = match fs::read_to_string(&path) { Ok(c) => c, Err(_) => continue };
+            let v: serde_json::Value = match serde_json::from_str(&content) { Ok(v) => v, Err(_) => continue };
+
+            let id = match v.get("sessionId").and_then(|s| s.as_str()) {
+                Some(id) => id.to_string(),
+                None => continue,
+            };
+            if known_ids.contains(&id) { continue; }
+
+            let started_at = v.get("startTime").and_then(|s| s.as_str()).unwrap_or("").to_string();
+
+            let first_message = v.get("messages")
+                .and_then(|m| m.as_array())
+                .and_then(|msgs| msgs.iter().find_map(|msg| {
+                    if msg.get("type").and_then(|t| t.as_str()) != Some("user") { return None; }
+                    let content = msg.get("content")?;
+                    if let Some(arr) = content.as_array() {
+                        for block in arr {
+                            let text = block.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                            if !text.is_empty() {
+                                return Some(text.chars().take(80).collect::<String>());
+                            }
+                        }
+                        None
+                    } else {
+                        content.as_str().filter(|s| !s.is_empty()).map(|s| s.chars().take(80).collect())
+                    }
+                }));
+
+            sessions.push(AgentSession {
+                id: Some(id),
+                agent: AgentKind::Gemini,
+                started_at,
+                prompt: None,
+                first_message,
+            });
+        }
+    }
 }
 
 // Parse ISO 8601 timestamp to unix seconds (simplified, no external crate)
@@ -6697,13 +6980,31 @@ fn session_is_exported(session: &AgentSession, project_path: &Path) -> bool {
 
 fn jsonl_path_for_session(session: &AgentSession, project_path: &Path) -> Option<PathBuf> {
     let id = session.id.as_ref()?;
-    for dir in claude_project_dirs(project_path) {
-        let p = dir.join(format!("{}.jsonl", id));
-        if p.exists() {
-            return Some(p);
+    match session.agent {
+        AgentKind::Claude => {
+            for dir in claude_project_dirs(project_path) {
+                let p = dir.join(format!("{}.jsonl", id));
+                if p.exists() { return Some(p); }
+            }
+            None
         }
+        AgentKind::Pi => {
+            let home = dirs_home()?;
+            let pi_dir = home.join(".pi").join("agent").join("sessions")
+                .join(pi_encode_path(project_path));
+            fs::read_dir(&pi_dir).ok()?
+                .filter_map(|e| e.ok())
+                .find(|e| {
+                    let p = e.path();
+                    p.extension().and_then(|x| x.to_str()) == Some("jsonl")
+                        && p.file_stem().and_then(|s| s.to_str())
+                            .map(|stem| stem.ends_with(id.as_str()))
+                            .unwrap_or(false)
+                })
+                .map(|e| e.path())
+        }
+        _ => None,
     }
-    None
 }
 
 fn unix_to_iso(secs: u64) -> String {
@@ -6753,7 +7054,7 @@ fn format_session_date(iso: &str) -> String {
 fn handle_sessions(app: &mut App, key: KeyCode) -> bool {
     match &app.sessions_state.clone() {
         SessionsState::NewPicker { agent_idx, prompt_idx } => {
-            let agents = [AgentKind::Claude, AgentKind::Codex, AgentKind::Gemini];
+            let agents = [AgentKind::Claude, AgentKind::Codex, AgentKind::Gemini, AgentKind::Pi];
             let agent_count = agents.len();
             match key {
                 KeyCode::Esc => {
@@ -6809,7 +7110,6 @@ fn handle_sessions(app: &mut App, key: KeyCode) -> bool {
                         first_message: None,
                     };
                     app.sessions.insert(0, session);
-                    save_sessions(&path, &app.sessions);
                     if app.sessions_list_state.selected().is_none() {
                         app.sessions_list_state.select(Some(0));
                     }
@@ -6865,8 +7165,7 @@ fn handle_sessions(app: &mut App, key: KeyCode) -> bool {
                         } else {
                             app.sessions_list_state.select(None);
                         }
-                        save_sessions(&path, &app.sessions);
-                        app.sessions_message = Some("session removed".to_string());
+                        app.sessions_message = Some("session removed from view".to_string());
                     }
                 }
                 KeyCode::Char('s') => {
@@ -7074,7 +7373,7 @@ fn draw_sessions(frame: &mut Frame, app: &App) {
         // Preview the generated command
         let Some(proj_idx) = app.active_project_idx else { return; };
         let Some(project) = app.projects.get(proj_idx) else { return; };
-        let agent_kind = [AgentKind::Claude, AgentKind::Codex, AgentKind::Gemini][*agent_idx].clone();
+        let agent_kind = [AgentKind::Claude, AgentKind::Codex, AgentKind::Gemini, AgentKind::Pi][*agent_idx].clone();
         let prompt_name = prompt_idx.and_then(|i| app.project_prompts.get(i)).map(|p| p.name.as_str());
         let cmd_preview = agent_kind.launch_cmd(&project.path, prompt_name);
 
@@ -7347,23 +7646,105 @@ fn handle_skills(app: &mut App, key: KeyCode) -> bool {
     false
 }
 
+fn handle_agents(app: &mut App, key: KeyCode) -> bool {
+    if app.skills_browse {
+        return handle_skills(app, key);
+    }
+    if !matches!(&app.sessions_state, SessionsState::List) {
+        return handle_sessions(app, key);
+    }
+
+    match key {
+        KeyCode::Left | KeyCode::Char('h') => {
+            app.agent_section = app.agent_section.prev();
+            return false;
+        }
+        KeyCode::Right | KeyCode::Char('l') => {
+            app.agent_section = app.agent_section.next();
+            return false;
+        }
+        _ => {}
+    }
+
+    match app.agent_section {
+        AgentSection::Mcp => handle_mcp(app, key),
+        AgentSection::Skills => handle_skills(app, key),
+        AgentSection::Sessions => handle_sessions(app, key),
+    }
+}
+
 fn handle_mcp(app: &mut App, key: KeyCode) -> bool {
     let len = app.mcp_servers.len();
-    if len == 0 {
-        return false;
-    }
     match key {
-        KeyCode::Down | KeyCode::Char('j') => {
+        KeyCode::Down | KeyCode::Char('j') if len > 0 => {
             let n = (app.mcp_list_state.selected().unwrap_or(0) + 1) % len;
             app.mcp_list_state.select(Some(n));
         }
-        KeyCode::Up | KeyCode::Char('k') => {
+        KeyCode::Up | KeyCode::Char('k') if len > 0 => {
             let n = app
                 .mcp_list_state
                 .selected()
                 .map(|i| if i == 0 { len - 1 } else { i - 1 })
                 .unwrap_or(0);
             app.mcp_list_state.select(Some(n));
+        }
+        KeyCode::Char('i') => {
+            if let Some(project) = app.active_project_idx.and_then(|i| app.projects.get(i)) {
+                let path = project.path.clone();
+                let mcp = path.join(".mcp.json");
+                if !mcp.exists() {
+                    match fs::write(&mcp, "{}") {
+                        Ok(_) => { app.mcp_message = Some("Created .mcp.json".to_string()); }
+                        Err(e) => { app.mcp_message = Some(format!("Error: {e}")); }
+                    }
+                } else {
+                    app.mcp_message = Some(".mcp.json already exists".to_string());
+                }
+                app.refresh_mcp();
+                app.refresh_setup();
+            }
+        }
+        KeyCode::Char('e') => {
+            if let Some(project) = app.active_project_idx.and_then(|i| app.projects.get(i)) {
+                let path = project.path.clone();
+                let mcp = path.join(".mcp.json");
+                if !mcp.exists() {
+                    let _ = fs::write(&mcp, "{}");
+                }
+                app.pending_editor = Some(mcp);
+            }
+        }
+        KeyCode::Char('d') => {
+            if let Some(project) = app.active_project_idx.and_then(|i| app.projects.get(i)) {
+                let path = project.path.clone();
+                let mcp = path.join(".mcp.json");
+                app.mcp_message = Some(
+                    fs::remove_file(&mcp)
+                        .map(|_| "Removed .mcp.json".to_string())
+                        .unwrap_or_else(|e| format!("Error: {e}"))
+                );
+                app.refresh_mcp();
+                app.refresh_setup();
+            }
+        }
+        KeyCode::Char('r') => {
+            app.refresh_mcp();
+            app.mcp_message = Some("Reloaded MCP servers".to_string());
+        }
+        KeyCode::Char('y') | KeyCode::Enter if len > 0 => {
+            if let Some(server) = app
+                .mcp_list_state
+                .selected()
+                .and_then(|i| app.mcp_servers.get(i))
+            {
+                let cmd = if server.args.is_empty() {
+                    server.command.clone()
+                } else {
+                    format!("{} {}", server.command, server.args.join(" "))
+                };
+                copy_to_clipboard(&cmd);
+                app.mcp_message = Some(format!("copied: {cmd}"));
+            }
         }
         _ => {}
     }

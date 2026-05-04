@@ -1,19 +1,28 @@
 # pemguin — Architecture Overview
 
+## Design Philosophy
+
+Observer-first, modifier-second, zero-config. pemguin reads from where agents naturally store things. It does not reproduce agent data in project directories or steer agents toward any structure. The only config it writes is `~/.pemguin.toml` (projects root + theme).
+
 ## Structure
 
-pemguin is a single-file Rust TUI application. All state, rendering, key handling, data loading, and GitHub integration live in `cli/src/lib.rs` (~7800 lines). `src/main.rs` is a thin entry point that calls `pemguin::start()`; `src/bin/pm.rs` provides the `pm` binary alias. The TUI is built on Ratatui + Crossterm.
+Everything lives in `cli/src/lib.rs` (~9000 lines). Two entry surfaces:
+
+- **TUI**: Ratatui application started by `pemguin::start()`
+- **CLI**: machine-oriented commands dispatched by `pemguin::run_cli()`
+
+`src/main.rs` and `src/bin/pm.rs` both route to CLI when subcommands are present, otherwise start the TUI. Backend: Ratatui + Crossterm.
 
 ## Screen Model
 
-Two top-level screens:
-
 ```
 Screen::Projects          — root project list
-Screen::InProject(tab)    — drilled into a project, showing one of 8 tabs
+Screen::InProject(tab)    — drilled into a project, one of 7 tabs
 ```
 
-Tab variants: `Home | Issues | Config | Prompts | Memories | Skills | Mcp | Pane | Sessions`
+Tabs: `Home | Issues | Config | Prompts | Memories | Agents | Pane`
+
+The Agents tab has three sub-sections navigated with `[`/`]`: `Mcp | Skills | Sessions`
 
 ## Application State (`App`)
 
@@ -23,8 +32,7 @@ Key fields:
 - `projects: Vec<Project>` — scanned project list
 - `project_entries: Vec<ProjectEntry>` — flat render list (Group headers + Item indices)
 - `repo: String` — active project's `owner/repo` slug
-- `context: String` — `"owner/repo (branch)"` used for prompt auto-fill
-- Per-tab state: `issue_list_state`, `setup_items`, `prompt_state`, `memory_files`, `skills`, `mcp_servers`, pane launcher state, etc.
+- Per-tab state: `issue_list_state`, `setup_items`, `memory_files`, `skills`, `mcp_servers`, `sessions`, pane state, etc.
 
 ## Layout
 
@@ -32,26 +40,26 @@ Every InProject screen uses a 2-row header:
 
 ```
 ┌──────────────────────────────────────────┐
-│  header row: 🐧 pm  repo-name  branch    │  ← identity
-│  nav row:  1 home  2 issues  3 config …  │  ← tabs
+│  header row: 🐧 pm  repo-name  branch    │
+│  nav row:  1 home  2 issues  3 config …  │
 ├──────────────────────────────────────────┤
-│  content area (Min(0))                   │
+│  content area                            │
 ├──────────────────────────────────────────┤
 │  footer: key hints                       │
 └──────────────────────────────────────────┘
 ```
 
-Some tabs add a variable-height middle row (edit input, status message).
+Some tabs add variable-height rows for inputs and status messages.
 
 ## Key Handling
 
 `handle_key()` dispatches in layers:
 
 1. `Ctrl+C` — always quit
-2. Global InProject handlers (when not in a sub-flow): `Esc` → back, `q` → quit, `Tab` / number keys → switch tab
-3. Sub-screen handler: `handle_home`, `handle_issues`, `handle_prompts`, etc.
+2. Global InProject handlers: `Esc` → back, `q` → quit, `Tab`/number keys → switch tab
+3. Tab-specific handler: `handle_home`, `handle_issues`, `handle_setup`, `handle_memories`, etc.
 
-Sub-flows (prompt fill, home edit, memory input) capture all keys and suppress global nav until dismissed with `Esc` or `Enter`.
+Sub-flows (prompt fill, home edit, memory input) capture all keys and suppress global nav until dismissed.
 
 ## Project Scanning
 
@@ -59,54 +67,72 @@ Sub-flows (prompt fill, home edit, memory input) capture all keys and suppress g
 
 ```
 ~/Projects/
-  repo-a/           ← level 1, .git present → included, group=""
-  _org/             ← level 1, no .git
-    repo-b/         ← level 2, .git present → included, group="_org"
-    repo-c/cli/     ← level 3, .git present → NOT found
+  repo-a/         ← level 1, .git present → included, group=""
+  _org/           ← level 1, no .git
+    repo-b/       ← level 2, .git present → included, group="_org"
+    repo-c/cli/   ← level 3, NOT found
 ```
 
-For each found directory, `project_info()` runs git inspection and setup checks, and scanning is parallelized across worker threads. The initial scan runs in the background after the TUI opens.
+`project_info()` runs git inspection and setup checks per directory. Scanning is parallelized across worker threads. Initial scan runs in the background after TUI opens.
+
+## Agent Storage Readers
+
+Native agent storage is read directly — no intermediate files. See `docs/agents/` for the full storage interface spec for each agent.
+
+### Sessions (`resolve_sessions`)
+
+Called when the Sessions sub-section is first opened. Reads from:
+
+- **Claude**: `claude_project_dirs()` returns matching `~/.claude/projects/<encoded>/` dirs (checks both v1 and v2 path encoding). Scans JSONL files.
+- **Codex**: `import_codex_sessions()` walks `~/.codex/sessions/YYYY/MM/DD/` and matches `cwd` field in the `session_meta` first line.
+- **Gemini**: `import_gemini_sessions()` reads `~/.gemini/projects.json` for the project name, then scans `~/.gemini/tmp/<name>/chats/` JSON files.
+- **Pi**: `import_pi_sessions()` uses `pi_encode_path()` to find `~/.pi/agent/sessions/<encoded>/` and reads JSONL files.
+
+### Memories (`reload_memories`)
+
+Three views switchable within the Memories tab:
+
+- **Claude** (`c`): `~/.claude/projects/<encoded>/memory/*.md`
+- **Codex** (`x`): `~/.codex/memories/<repo-name>/*.md`
+- **Gemini** (`g`): `~/.gemini/GEMINI.md` (single file, global)
+
+### Path Encoding
+
+| Agent | Rule | Example |
+|-------|------|---------|
+| Claude | non-alphanumeric → `-` (two variants: `_` preserved or converted) | `-Users-josh-Projects--foo` |
+| Codex | date-bucketed; match by `cwd` field | n/a |
+| Gemini | project name from `~/.gemini/projects.json` | `astrds` |
+| Pi | strip leading `/`, replace `/` with `-`, wrap in `--` | `--Users-josh-Projects-_foo--` |
 
 ## Data Flow
 
 ```
 App::new()
   → spawn background scan_projects()
-  → render root immediately
-  → apply AsyncResult::Projects when scan finishes
+  → render root immediately (shows "Scanning…")
 
-App::open_project(idx)
-  → load_home_data_local()   — local git/setup reads only
-  → load_prompts()           — filesystem read
-  → scan_setup()             — filesystem checks
-  → spawn background Home hydrate (gh repo view + avatar)
-  → defer Issues / Memories / Skills / MCP until tab visit
+On project open (switch_project):
+  → start_home_load() — spawns background thread for gh API calls
+  → lazy tab loading via ensure_tab_loaded()
 
-Config item actions
-  → enter                     — safe apply if missing
-  → e                         — edit current or default file via $EDITOR
-  → d                         — delete/remove managed item
-  → R                         — reset managed item to pemguin default
+On tab open:
+  → Memories: reload_memories() reads native agent storage
+  → Agents/Sessions: resolve_sessions() scans all 4 agent stores
+  → Agents/Skills: load_skills() reads ~/.agents/.skill-lock.json
+  → Agents/MCP: load_mcp_servers() reads .mcp.json + ~/.claude.json
 ```
 
-Background work returns through an internal async result channel that is polled from the main event loop. The UI renders loading states while Home, Issues, avatar, or project scans are in flight.
+## Agent Storage Maintenance
 
-## Prompt System
+When an agent updates its storage format:
 
-Prompts are Markdown files. Placeholders use `{PLACEHOLDER}` syntax. `auto_values()` pre-fills `{REPO}`, `{BRANCH}`, `{ISSUE}` from app state. Remaining placeholders are filled interactively via `PromptState::Fill`. `extract_body()` strips the first fenced code block if present (used for copying just the template content).
+1. Validate against disk using the checklist in `docs/agents/<agent>.md`
+2. Update `docs/agents/<agent>.md`
+3. Update the relevant reader function in `cli/src/lib.rs`
 
-## Theme System
-
-Colors are defined in a `ThemeConfig` struct loaded from `~/.pemguin.toml` at startup. The global theme is stored in a `thread_local! { Cell<Option<Theme>> }` and updated via `set_theme()`. The main loop calls `reload_pemguin_theme_if_changed()` on every iteration — it compares the file's `mtime` to the last-seen value and reloads if changed (~50ms detection).
-
-The theme file is generated by the whaleen dotfiles `theme/generate.sh`. Editing the palette and running generate lets you see changes live in the running TUI without restart.
-
-Theme fields: `accent`, `sel_fg`, `fg_dim`, `fg_xdim`, `border`, `surface`, `green`, `red`, `yellow`, `purple`.
-
-## Pane Tab
-
-Tab 8 is currently a launcher for project-scoped external tools. It suspends the TUI, runs `lazygit`, `yazi`, or `$EDITOR` in the repo root, then resumes pm when the child process exits. The longer-term direction is still an embedded PTY-backed pane.
-
-## Sessions Tab
-
-Tab 9 lists per-project agent sessions (Claude Code, Codex). Sessions are persisted to `.pemguin/sessions.toml`. Claude sessions are imported from `~/.claude/projects/`, Codex from `~/.codex/sessions/YYYY/MM/DD/`. Session IDs are nullable — present when resolved locally, absent when pending. Exports go to `.pemguin/exports/` as markdown and plain text.
+Reader functions by agent:
+- Claude: `claude_project_dirs()`, `resolve_sessions()`, `claude_memory_path()`
+- Codex: `import_codex_sessions()`, `parse_codex_session()`, `codex_memory_dirs()`
+- Gemini: `import_gemini_sessions()`, `gemini_memory_path()`
+- Pi: `import_pi_sessions()`, `pi_encode_path()`

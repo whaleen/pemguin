@@ -1,12 +1,10 @@
 # pemguin 🐧
 
-Terminal project manager for developers who live in the CLI.
+Terminal project manager for developers who work with AI agents.
 
-## What it does
+`pm` / `pemguin` is a Ratatui TUI that gives you a single place to navigate all your local git repos. It surfaces GitHub issues, context file status, agent memories, skills, MCP servers, and session history — without leaving the terminal.
 
-`pm` / `pemguin` is a Ratatui TUI that keeps your dev projects organized. For each project it surfaces config status, GitHub issues, prompts, memory files, skills, MCP servers, and project tools — all without leaving the terminal.
-
-Startup scanning and GitHub-backed project data load in the background, so the UI stays responsive while data hydrates.
+**Observer-first.** pemguin reads from where agents naturally store things. It does not reproduce agent data in its own directories or steer agents toward any structure.
 
 ## Install
 
@@ -16,7 +14,7 @@ cd pemguin/cli
 cargo install --path .
 ```
 
-This installs both `pm` and `pemguin`.
+Installs both `pm` and `pemguin`.
 
 Requires: Rust stable, `gh` CLI (authenticated), Nerd Font terminal.
 
@@ -31,26 +29,63 @@ Navigate with `↑↓` or `jk`. Press `enter` to open a project. `esc` goes back
 
 ### Project tabs
 
-| Key | Tab |
-|-----|-----|
-| `1` | Home — repo info, description, recent commits |
-| `2` | Issues — open GitHub issues, copy prompt to work on one |
-| `3` | Config — managed repo files like AGENT.md, SPEC.md, .gitignore, prompts, memory |
-| `4` | Prompts — global (`~/.pemguin/prompts/`) and project (`.prompts/`) |
-| `5` | Memories — `.memory/`, `~/.pemguin/memory/`, `.claude/.../memory/` |
-| `6` | Skills — installed skills from `skills-lock.json` |
-| `7` | MCP — configured servers from `.mcp.json` |
-| `8` | Pane — launch project tools like `lazygit`, `yazi`, and `$EDITOR` |
+| Key | Tab | What it shows |
+|-----|-----|---------------|
+| `1` | Home | Repo info, description, recent commits, stack |
+| `2` | Issues | Open GitHub issues; copy prompt to work on one |
+| `3` | Config | Native agent context files: CLAUDE.md, AGENTS.md, GEMINI.md, .mcp.json |
+| `4` | Prompts | Prompt templates (global and project-level) |
+| `5` | Memories | Native agent auto-memory: Claude (`c`), Codex (`x`), Gemini (`g`) |
+| `6` | Agents | MCP servers, installed skills, and per-project sessions |
+| `7` | Pane | Launch project tools: lazygit, yazi, $EDITOR |
 
-### Projects root
+### Sessions (Agents tab)
 
-| Key | Action |
-|-----|--------|
-| `r` | Refresh selected project row |
-| `R` | Rescan all projects |
-| `s` | Sync GitHub metadata |
-| `enter` | Open project |
-| `q` | Quit |
+Sessions are discovered directly from each agent's native storage:
+
+| Agent | Storage location |
+|-------|-----------------|
+| Claude Code | `~/.claude/projects/<encoded>/` JSONL |
+| Codex | `~/.codex/sessions/YYYY/MM/DD/` JSONL |
+| Gemini CLI | `~/.gemini/tmp/<project-name>/chats/` JSON |
+| Pi | `~/.pi/agent/sessions/<encoded>/` JSONL |
+
+`n` — copy a new session launch command to clipboard  
+`y`/Enter — copy a resume command for the selected session  
+`s` — inline session summary (Claude + Pi)
+
+### Memories (Memories tab)
+
+| Key | View | Source |
+|-----|------|--------|
+| `c` | Claude | `~/.claude/projects/<encoded>/memory/` |
+| `x` | Codex | `~/.codex/memories/<repo-name>/` |
+| `g` | Gemini | `~/.gemini/GEMINI.md` (global) |
+
+`e`/Enter edits the selected file. `n` creates a new memory file (or opens GEMINI.md for the Gemini view). `d` deletes.
+
+### MCP server
+
+`pm` can run as a local stdio MCP server:
+
+```bash
+pm mcp serve
+```
+
+Exposed tools: `pemguin_project_inspect`, `pemguin_setup_plan`, `pemguin_agent_instructions`
+
+Example `.mcp.json` entry:
+
+```json
+{
+  "mcpServers": {
+    "pemguin": {
+      "command": "pm",
+      "args": ["mcp", "serve"]
+    }
+  }
+}
+```
 
 ## Configuration
 
@@ -58,34 +93,43 @@ Navigate with `↑↓` or `jk`. Press `enter` to open a project. `esc` goes back
 
 ```toml
 [projects]
-root = "~/Projects"   # directory to scan (2 levels deep for .git)
+root = "~/Projects"   # scanned 2 levels deep for .git dirs
 
 [theme]
-accent  = "#e8b887"   # hot-reloaded on file change — no restart needed
+accent  = "#e8b887"   # hot-reloaded on file change
 sel_fg  = "#101010"
 fg_dim  = "#A0A0A0"
 fg_xdim = "#7E7E7E"
-border  = "#232323"
-surface = "#1C1C1C"
 green   = "#90b99f"
 red     = "#f5a191"
 yellow  = "#e6b99d"
 purple  = "#aca1cf"
 ```
 
-Or set `PEMGUIN_PROJECTS_DIR` env var for projects root.
+Set `PEMGUIN_PROJECTS_DIR` to override `projects.root` via env.
 
-Theme changes are detected within ~50ms. If using the whaleen dotfiles, run `theme/generate.sh` to propagate palette changes to all tools including pemguin.
+Theme changes are detected within ~50ms — no restart needed.
+
+## Supported agents
+
+pemguin reads native storage for four agents:
+
+| Agent | Binary | Sessions | Memory | Skills |
+|-------|--------|----------|--------|--------|
+| Claude Code | `claude` | `~/.claude/projects/` | `~/.claude/projects/<enc>/memory/` | `~/.claude/skills/` |
+| Codex | `codex` | `~/.codex/sessions/` | `~/.codex/memories/` | `~/.codex/skills/` |
+| Gemini CLI | `gemini` | `~/.gemini/tmp/` | `~/.gemini/GEMINI.md` | `~/.gemini/skills/` |
+| Pi | `pi` | `~/.pi/agent/sessions/` | — | `~/.pi/agent/skills/` |
+
+See `docs/agents/` for the detailed storage interface docs used to implement each reader.
 
 ## Project structure
 
 ```
 pemguin/
-  cli/            — Rust TUI source
-  prompts/        — built-in prompt templates
-  stacks/         — stack reference sheets
-  docs/           — architecture and feature docs
-  AGENT.md        — agent context for this repo
-  SPEC.md         — feature checklist
-  CONSTITUTION.md — universal dev principles
+  cli/          — Rust TUI + CLI source
+  docs/
+    agents/     — storage interface docs for each supported agent
+    architecture/ — app structure and data flow
+  templates/    — built-in prompt and doc templates
 ```
